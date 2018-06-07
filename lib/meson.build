@@ -10,7 +10,8 @@ else
 endif
 
 if cfg.get('HAVE_VIRTIO', 0) == 1
-   libfuse_sources += [ 'libvhost-user/libvhost-user.c' ]
+   libfuse_sources += [ 'libvhost-user/libvhost-user.c',
+                        'fuse_virtio.c' ]
 endif
 
 if cfg.get('HAVE_ICONV')

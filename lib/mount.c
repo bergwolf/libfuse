@@ -260,6 +260,11 @@ void fuse_kern_unmount(const char *mountpoint, int fd)
 	int res;
 	int pid;
 
+        if (!mountpoint) {
+                /* virtio-fs doesn't actually mount */
+                return;
+        }
+
 	if (fd != -1) {
 		struct pollfd pfd;
 

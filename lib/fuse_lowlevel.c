@@ -17,6 +17,9 @@
 #include "fuse_opt.h"
 #include "fuse_misc.h"
 #include "mount_util.h"
+#ifdef HAVE_VIRTIO
+#include "fuse_virtio.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2909,6 +2912,12 @@ out1:
 int fuse_session_mount(struct fuse_session *se, const char *mountpoint)
 {
 	int fd;
+
+#ifdef HAVE_VIRTIO
+        if (se->virtio_socket_path) {
+                return virtio_session_mount(se);
+        }
+#endif
 
 	/*
 	 * Make sure file descriptors 0, 1 and 2 are open, otherwise chaos
