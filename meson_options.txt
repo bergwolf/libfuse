@@ -9,3 +9,6 @@ option('utils', type : 'boolean', value : true,
 
 option('examples', type : 'boolean', value : true,
        description: 'Wheter or not to build example programs')
+
+option('with-virtio', type : 'boolean', value : false,
+       description: 'Enable virtio-fs support')

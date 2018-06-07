@@ -48,8 +48,12 @@ Normally, the default build options will work fine. If you
 nevertheless want to adjust them, you can do so with the *mesonconf*
 command:
 
-    $ mesonconf # list options
-    $ mesonconf  -D disable-mtab=true # set an option
+    $ meson configure # list options
+    $ meson configure  -D disable-mtab=true # set an option
+
+If you want to build libfuse for use with virtio-fs then use:
+
+    $ meson configure -D with-virtio=true
 
 To build, test and install libfuse, you then use Ninja:
 
