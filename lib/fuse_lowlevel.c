@@ -2598,6 +2598,9 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("-d", debug, 1),
 	LL_OPTION("--debug", debug, 1),
 	LL_OPTION("allow_root", deny_others, 1),
+#ifdef HAVE_VIRTIO
+        LL_OPTION("virtio_socket=%s", virtio_socket_path, 0),
+#endif
 	FUSE_OPT_END
 };
 
@@ -2615,6 +2618,9 @@ void fuse_lowlevel_help(void)
 	printf(
 "    -o allow_other         allow access by all users\n"
 "    -o allow_root          allow access by root\n"
+#ifdef HAVE_VIRTIO
+"    -o virtio_socket=PATH  path for the vhost-user socket to talk to QEMU\n"
+#endif
 "    -o auto_unmount        auto unmount on process termination\n");
 }
 

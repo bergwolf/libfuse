@@ -64,6 +64,9 @@ struct fuse_session {
 	struct fuse_notify_req notify_list;
 	size_t bufsize;
 	int error;
+#ifdef HAVE_VIRTIO
+        char *virtio_socket_path;
+#endif
 };
 
 struct fuse_chan {
