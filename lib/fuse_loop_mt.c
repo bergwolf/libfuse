@@ -13,6 +13,7 @@
 #include "fuse_misc.h"
 #include "fuse_kernel.h"
 #include "fuse_i.h"
+#include "fuse_virtio.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -310,6 +311,10 @@ int fuse_session_loop_mt_32(struct fuse_session *se, struct fuse_loop_config *co
 	int err;
 	struct fuse_mt mt;
 	struct fuse_worker *w;
+
+        if (se->virtio_socket_path) {
+                return virtio_loop(se);
+        }
 
 	memset(&mt, 0, sizeof(struct fuse_mt));
 	mt.se = se;

@@ -10,6 +10,7 @@
 #include "fuse_lowlevel.h"
 
 struct mount_opts;
+struct fv_VuDev;
 
 struct fuse_req {
 	struct fuse_session *se;
@@ -66,6 +67,8 @@ struct fuse_session {
 	int error;
 #ifdef HAVE_VIRTIO
         char *virtio_socket_path;
+        int   virtio_socketfd;
+        struct fv_VuDev *virtio_dev;
 #endif
 };
 
