@@ -56,7 +56,7 @@
 
 /* The version of the protocol we support */
 #define VHOST_USER_VERSION 1
-#define LIBVHOST_USER_DEBUG 0
+#define LIBVHOST_USER_DEBUG 1
 
 #define DPRINT(...)                             \
     do {                                        \
