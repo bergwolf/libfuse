@@ -14,6 +14,8 @@
  */
 
 /* this code avoids GLib dependency */
+/* for vasprintf */
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -62,6 +64,30 @@
             fprintf(stderr, __VA_ARGS__);        \
         }                                       \
     } while (0)
+
+/* In the libfuse build we've not got some of QEMUs compiler headers,
+ * pull in the few common cases from QEMU headers
+ */
+#ifndef smp_wmb
+#define smp_wmb()   smp_mb_release()
+#endif
+#ifndef smp_rmb
+#define smp_rmb()   smp_mb_acquire()
+#endif
+
+/* Compiler barrier */
+#define barrier()   ({ asm volatile("" ::: "memory"); (void)0; })
+
+#ifdef __ATOMIC_RELAXED
+#define smp_mb()                     ({ barrier(); __atomic_thread_fence(__ATOMIC_SEQ_CST); })
+#define smp_mb_release()             ({ barrier(); __atomic_thread_fence(__ATOMIC_RELEASE); })
+#define smp_mb_acquire()             ({ barrier(); __atomic_thread_fence(__ATOMIC_ACQUIRE); })
+#define atomic_or(ptr, n)  ((void) __atomic_fetch_or(ptr, n, __ATOMIC_SEQ_CST))
+
+#else
+#error "Relying on C11 atomics"
+#endif
+#define unlikely(x)   __builtin_expect(!!(x), 0)
 
 static const char *
 vu_request_to_string(unsigned int req)
