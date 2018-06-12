@@ -9,6 +9,10 @@ else
    libfuse_sources += [ 'mount_bsd.c' ]
 endif
 
+if cfg.get('HAVE_VIRTIO', 0) == 1
+   libfuse_sources += [ 'libvhost-user/libvhost-user.c' ]
+endif
+
 if cfg.get('HAVE_ICONV')
    libfuse_sources += [ 'modules/iconv.c' ]
 endif
