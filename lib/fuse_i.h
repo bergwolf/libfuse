@@ -11,6 +11,7 @@
 
 struct mount_opts;
 struct fv_VuDev;
+struct fv_QueueInfo;
 
 struct fuse_req {
 	struct fuse_session *se;
@@ -76,6 +77,9 @@ struct fuse_chan {
 	pthread_mutex_t lock;
 	int ctr;
 	int fd;
+#ifdef HAVE_VIRTIO
+        struct fv_QueueInfo *qi;
+#endif
 };
 
 /**
