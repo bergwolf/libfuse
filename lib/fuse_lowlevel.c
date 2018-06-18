@@ -187,6 +187,10 @@ static int fuse_send_msg(struct fuse_session *se, struct fuse_chan *ch,
 		}
 	}
 
+        if (se->virtio_socket_path) {
+                return virtio_send_msg(se, ch, iov, count);
+        }
+
 	ssize_t res = writev(ch ? ch->fd : se->fd,
 			     iov, count);
 	int err = errno;
