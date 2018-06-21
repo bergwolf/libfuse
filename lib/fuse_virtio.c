@@ -49,6 +49,7 @@ struct fv_QueueInfo {
 
         /* The element for the command currently being processed */
         VuVirtqElement *qe;
+        bool      reply_sent;
 };
 
 /* We pass the dev element into libvhost-user
@@ -217,6 +218,7 @@ int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
         } else {
                 /* For virtio we always have ch */
                 assert(ch);
+                assert(!ch->qi->reply_sent);
                 elem = ch->qi->qe;
                 q = &ch->qi->virtio_dev->dev.vq[ch->qi->qidx];
         }
@@ -252,6 +254,8 @@ int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
 err:
         if (out->unique == 0) {
                 pthread_mutex_unlock(&se->virtio_dev->notification_mutex);
+        } else {
+                ch->qi->reply_sent = true;
         }
         
         return ret;
@@ -331,6 +335,9 @@ static void *fv_queue_thread(void *opaque)
                                break;
                        }
 
+                       qi->qe = elem;
+                       qi->reply_sent = false;
+
                        if (!fbuf.mem) {
                                fbuf.mem = malloc(se->bufsize);
                                assert(fbuf.mem);
@@ -365,6 +372,16 @@ static void *fv_queue_thread(void *opaque)
                        // TODO: Add checks for fuse_session_exited
                        fuse_session_process_buf_int(se, &fbuf, &ch);
 
+                       if (!qi->reply_sent) {
+			       if (se->debug) {
+				       fprintf(stderr,
+					       "%s: elem %d no reply sent\n",
+					       __func__, elem->index);
+			       }
+                               /* I think we've still got to recycle the element */
+                               vu_queue_push(dev, q, elem, 0);
+                               vu_queue_notify(dev, q);
+                       }
                        qi->qe = NULL;
                        free(elem);
                        elem = NULL;
