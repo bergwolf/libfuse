@@ -63,6 +63,8 @@ struct fv_VuDev {
          * virtio_loop */
         size_t nqueues;
         struct fv_QueueInfo **qi;
+
+        pthread_mutex_t notification_mutex;
 };
 
 /* From spec */
@@ -177,6 +179,7 @@ static void copy_iov(struct iovec *src_iov, int src_count,
 int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
                     struct iovec *iov, int count)
 {
+        int ret = 0;
         VuVirtqElement *elem;
         VuVirtq *q;
 
@@ -192,6 +195,25 @@ int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
                 /* Notify, has to be sent on queue 0 */
                 fprintf(stderr, "%s: TODO notify support\n", __func__);
                 return -1;
+
+                pthread_mutex_lock(&se->virtio_dev->notification_mutex);
+                q = &se->virtio_dev->dev.vq[0];
+                if (!q) {
+                        fprintf(stderr,
+                                "%s: Can't notify - Queue 0 not started\n",
+                                __func__);
+                        ret = -ENOENT;
+                        goto err;
+                }
+                elem = vu_queue_pop(&se->virtio_dev->dev, q, sizeof(VuVirtqElement));
+                if (!elem) {
+                        // TODO: Should we drop the lock and wait for one?
+                        fprintf(stderr,
+                                "%s: Can't notify - Queue 0 empty\n",
+                                __func__);
+                        ret = -ENOENT;
+                        goto err;
+                }
         } else {
                 /* For virtio we always have ch */
                 assert(ch);
@@ -213,24 +235,26 @@ int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
         if (in_len < sizeof(struct fuse_out_header)) {
                 fprintf(stderr, "%s: elem %d too short for out_header\n",
                         __func__, elem->index);
-                return -E2BIG;
+                ret = -E2BIG;
+                goto err;
         }
         if (in_len < tosend_len) {
                 fprintf(stderr, "%s: elem %d too small for data len %zd\n",
                         __func__, elem->index, tosend_len);
-                return -E2BIG;
+                ret = -E2BIG;
+                goto err;
         }
 
         copy_iov(iov, count, in_sg, in_num, tosend_len);
-        if (out->unique == 0) {
-                fprintf(stderr, "%s: TODO notify support\n", __func__);
-                return -1;
-        } else {
-                vu_queue_push(&se->virtio_dev->dev, q, elem, tosend_len);
-                vu_queue_notify(&se->virtio_dev->dev, q);
-        }
+        vu_queue_push(&se->virtio_dev->dev, q, elem, tosend_len);
+        vu_queue_notify(&se->virtio_dev->dev, q);
 
-        return 0;
+err:
+        if (out->unique == 0) {
+                pthread_mutex_unlock(&se->virtio_dev->notification_mutex);
+        }
+        
+        return ret;
 }
 
 /* Thread function for individual queues, created when a queue is 'started' */
@@ -361,15 +385,10 @@ static void fv_queue_set_started(VuDev *dev, int qidx, bool started)
         fprintf(stderr, "%s: qidx=%d started=%d\n", __func__, qidx, started);
         assert(qidx>=0);
 
-        if (qidx == 0) {
-                /* This is a notification queue for us to tell the guest things
-                 *  we don't expect
-                 * any incoming from the guest here.
-                 */
-                return;
-        }
-
         if (started) {
+                if (qidx == 0) {
+                        pthread_mutex_lock(&vud->se->virtio_dev->notification_mutex);
+                }
                 /* Fire up a thread to watch this queue */
                 if (qidx >= vud->nqueues) {
                         vud->qi = realloc(vud->qi, (qidx + 1) *
@@ -391,6 +410,15 @@ static void fv_queue_set_started(VuDev *dev, int qidx, bool started)
                 }
                 ourqi = vud->qi[qidx];
                 ourqi->kick_fd = dev->vq[qidx].kick_fd;
+
+                if (qidx == 0) {
+                        pthread_mutex_unlock(&vud->se->virtio_dev->notification_mutex);
+                        /* This is a notification queue for us to tell the guest things
+                         *  we don't expect any incoming from the guest here.
+                         */
+                        return;
+                }
+
                 if (pthread_create(&ourqi->thread, NULL,  fv_queue_thread,
                                    ourqi)) {
                         fprintf(stderr, "%s: Failed to create thread for queue %d\n",
@@ -517,6 +545,7 @@ int virtio_session_mount(struct fuse_session *se)
         /* TODO: Some cleanup/deallocation! */
         se->virtio_dev = calloc(sizeof(struct fv_VuDev), 1);
         se->virtio_dev->se = se;
+        fuse_mutex_init(&se->virtio_dev->notification_mutex);
         vu_init(&se->virtio_dev->dev, se->virtio_socketfd,
                 fv_panic,
                 fv_set_watch, fv_remove_watch,
