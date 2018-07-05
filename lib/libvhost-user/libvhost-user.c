@@ -1002,6 +1002,34 @@ bool vu_set_queue_host_notifier(VuDev *dev, VuVirtq *vq, int fd,
     return vu_process_message_reply(dev, &vmsg);
 }
 
+bool vu_fs_cache_request(VuDev *dev, VhostUserSlaveRequest req, int fd,
+                         VhostUserFSSlaveMsg *fsm)
+{
+    int fd_num = 0;
+    VhostUserMsg vmsg = {
+        .request = req,
+        .flags = VHOST_USER_VERSION | VHOST_USER_NEED_REPLY_MASK,
+        .size = sizeof(vmsg.payload.fs),
+        .payload.fs = *fsm,
+    };
+
+    if (fd != -1) {
+        vmsg.fds[fd_num++] = fd;
+    }
+
+    vmsg.fd_num = fd_num;
+
+    if ((dev->protocol_features & VHOST_USER_PROTOCOL_F_SLAVE_SEND_FD) == 0) {
+        return false;
+    }
+
+    if (!vu_message_write(dev, dev->slave_fd, &vmsg)) {
+        return false;
+    }
+
+    return vu_process_message_reply(dev, &vmsg);
+}
+
 static bool
 vu_set_vring_call_exec(VuDev *dev, VhostUserMsg *vmsg)
 {

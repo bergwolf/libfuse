@@ -159,6 +159,13 @@ FUSE_3.4 {
 		fuse_reply_copy_file_range;
 } FUSE_3.3;
 
+FUSE_3.5 {
+	global:
+                fuse_virtio_map;
+                fuse_virtio_unmap;
+                fuse_virtio_sync;
+} FUSE_3.4;
+
 # Local Variables:
 # indent-tabs-mode: t
 # End:
