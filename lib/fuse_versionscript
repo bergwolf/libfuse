@@ -164,6 +164,7 @@ FUSE_3.5 {
                 fuse_virtio_map;
                 fuse_virtio_unmap;
                 fuse_virtio_sync;
+                fuse_reply_setupmapping;
 } FUSE_3.4;
 
 # Local Variables:
