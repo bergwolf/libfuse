@@ -3,20 +3,20 @@ examples = [ 'passthrough', 'passthrough_fh',
              'ioctl_client', 'poll_client', 'ioctl',
              'cuse', 'cuse_client' ]
 
+threaded_examples = [ 'notify_inval_inode',
+                      'invalidate_path',
+                      'notify_store_retrieve',
+                      'notify_inval_entry',
+                      'poll' ]
+
 if not platform.endswith('bsd') and platform != 'dragonfly'
-    examples += 'passthrough_ll'
+    threaded_examples += 'passthrough_ll'
 
     # According to Conrad Meyer <cem@freebsd.org>, FreeBSD doesn't
     # support mounting files, This is enforced in vfs_domount_first()
     # with the v_type != VDIR check.
     examples += [ 'null' ]
 endif
-
-threaded_examples = [ 'notify_inval_inode',
-                      'invalidate_path',
-                      'notify_store_retrieve',
-                      'notify_inval_entry',
-                      'poll' ]
 
 foreach ex : examples
     executable(ex, ex + '.c',
