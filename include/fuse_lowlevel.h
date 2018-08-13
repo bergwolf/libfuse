@@ -1218,7 +1218,7 @@ struct fuse_lowlevel_ops {
          * Unmap sections previously mapped by setupmapping
          * TODO
          */
-        void (*removemapping) (fuse_req_t req, fuse_ino_t ino, uint64_t offset,
+        void (*removemapping) (fuse_req_t req, fuse_ino_t ino, uint64_t moffset,
                                uint64_t len, struct fuse_file_info *fi);
 };
 
