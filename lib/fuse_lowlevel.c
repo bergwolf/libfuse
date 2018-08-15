@@ -516,6 +516,12 @@ static int fuse_send_data_iov_fallback(struct fuse_session *se,
 		return fuse_send_msg(se, ch, iov, iov_count);
 	}
 
+        if (se->virtio_socket_path && buf->count==1 &&
+            buf->buf[0].flags == (FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK)) {
+                res = virtio_send_data_iov(se, ch, iov, iov_count,
+                                           buf, len);
+                return res;
+        }
 	res = posix_memalign(&mbuf, pagesize, len);
 	if (res != 0)
 		return res;
