@@ -64,7 +64,7 @@ configure_file(output: 'config.h',
 # Compiler configuration
 #
 add_project_arguments('-D_REENTRANT', '-DHAVE_CONFIG_H', '-Wall', '-Wextra', '-Wno-sign-compare',
-                      '-Wstrict-prototypes', '-Wmissing-declarations', '-Wwrite-strings',
+                      '-Wstrict-prototypes', '-Wmissing-declarations', '-Wwrite-strings', '-Wno-unused-parameter',
                       '-fno-strict-aliasing', language: 'c')
 
 # Some (stupid) GCC versions warn about unused return values even when they are
