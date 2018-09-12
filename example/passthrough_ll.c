@@ -719,6 +719,7 @@ static void lo_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 		update_version(lo, lo_inode(req, parent));
 		fuse_reply_err(req, 0);
 	}
+	unref_inode(lo, inode, 1);
 }
 
 static void lo_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
@@ -732,7 +733,7 @@ static void lo_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 	if (!oldinode) {
 		fuse_reply_err(req, EIO);
-		return;
+		goto out;
 	}
 
 
@@ -747,7 +748,7 @@ static void lo_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
 		else
 			fuse_reply_err(req, res == -1 ? errno : 0);
 #endif
-		return;
+		goto out;
 	}
 
 	res = renameat(lo_fd(req, parent), name,
@@ -762,6 +763,9 @@ static void lo_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
 		update_version(lo, lo_inode(req, newparent));
 		fuse_reply_err(req, 0);
 	}
+out:
+	unref_inode(lo, oldinode, 1);
+	unref_inode(lo, newinode, 1);
 }
 
 static void lo_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -783,6 +787,7 @@ static void lo_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 		update_version(lo, lo_inode(req, parent));
 		fuse_reply_err(req, 0);
 	}
+	unref_inode(lo, inode, 1);
 }
 
 static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
