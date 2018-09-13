@@ -14,7 +14,10 @@
 struct fuse_session;
 
 int virtio_session_mount(struct fuse_session *se);
-int virtio_loop(struct fuse_session *se);
+/* single_thread when true only allows one request at a time,
+ * even though we still have one thread per queue.
+ */
+int virtio_loop(struct fuse_session *se, bool single_thread);
 int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
                     struct iovec *iov, int count);
 int virtio_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,

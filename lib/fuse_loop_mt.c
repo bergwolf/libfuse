@@ -313,7 +313,7 @@ int fuse_session_loop_mt_32(struct fuse_session *se, struct fuse_loop_config *co
 	struct fuse_worker *w;
 
         if (se->virtio_socket_path) {
-                return virtio_loop(se);
+                return virtio_loop(se, false);
         }
 
 	memset(&mt, 0, sizeof(struct fuse_mt));

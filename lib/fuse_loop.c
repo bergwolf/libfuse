@@ -11,6 +11,8 @@
 #include "config.h"
 #include "fuse_lowlevel.h"
 #include "fuse_i.h"
+#include "fuse_virtio.h"
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +24,10 @@ int fuse_session_loop(struct fuse_session *se)
 	struct fuse_buf fbuf = {
 		.mem = NULL,
 	};
+
+        if (se->virtio_socket_path) {
+                return virtio_loop(se, true /* single thread */);
+        }
 
 	while (!fuse_session_exited(se)) {
 		res = fuse_session_receive_buf_int(se, &fbuf, NULL);

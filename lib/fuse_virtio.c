@@ -66,6 +66,10 @@ struct fv_VuDev {
         struct fv_QueueInfo **qi;
 
         pthread_mutex_t notification_mutex;
+
+        /* Used for single threaded mode */
+        bool linearise_requests;
+        pthread_mutex_t request_mutex;
 };
 
 /* From spec */
@@ -548,6 +552,9 @@ static void *fv_queue_thread(void *opaque)
         
                        // TODO! Endianness of header
         
+                       if (qi->virtio_dev->linearise_requests) 
+                               pthread_mutex_lock(&qi->virtio_dev->request_mutex);
+
                        // TODO: Add checks for fuse_session_exited
                        fuse_session_process_buf_int(se, &fbuf, &ch);
 
@@ -564,6 +571,9 @@ static void *fv_queue_thread(void *opaque)
                        qi->qe = NULL;
                        free(elem);
                        elem = NULL;
+                       if (qi->virtio_dev->linearise_requests) 
+                               pthread_mutex_unlock(&qi->virtio_dev->request_mutex);
+
                 }
         }
         pthread_mutex_destroy(&ch.lock);
@@ -646,11 +656,15 @@ static const VuDevIface fv_iface = {
 
 /* Main loop; this mostly deals with events on the vhost-user
  * socket itself, and not actual fuse data.
+ * Note 'single_thread' is emulation of a single thread
+ * only allowing one request at a time, even though we've still
+ * got one queue per vq.
  */
-int virtio_loop(struct fuse_session *se)
+int virtio_loop(struct fuse_session *se, bool single_thread)
 {
        fprintf(stderr, "%s: Entry\n", __func__);
 
+       se->virtio_dev->linearise_requests = single_thread;
        while (!fuse_session_exited(se)) {
                struct pollfd pf[1];
                pf[0].fd = se->virtio_socketfd;
@@ -742,6 +756,7 @@ int virtio_session_mount(struct fuse_session *se)
         se->virtio_dev = calloc(sizeof(struct fv_VuDev), 1);
         se->virtio_dev->se = se;
         fuse_mutex_init(&se->virtio_dev->notification_mutex);
+        fuse_mutex_init(&se->virtio_dev->request_mutex);
         vu_init(&se->virtio_dev->dev, se->virtio_socketfd,
                 fv_panic,
                 fv_set_watch, fv_remove_watch,
