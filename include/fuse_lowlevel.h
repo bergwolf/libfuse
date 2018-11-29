@@ -1221,7 +1221,8 @@ struct fuse_lowlevel_ops {
          * Unmap sections previously mapped by setupmapping
          * TODO
          */
-        void (*removemapping) (fuse_req_t req, fuse_ino_t ino, uint64_t moffset,
+        void (*removemapping) (fuse_req_t req, struct fuse_session *se,
+                               fuse_ino_t ino, uint64_t moffset,
                                uint64_t len, struct fuse_file_info *fi);
 };
 
@@ -2089,11 +2090,11 @@ int fuse_virtio_map(fuse_req_t req, VhostUserFSSlaveMsg *msg, int fd);
 /**
  * For use with virtio-fs; request unmapping of part of the cache
  *
- * @param req The request that triggered this action
+ * @param se The session this request is on
  * @param msg A set of unmapping requests
  * @return Zero on success
  */
-int fuse_virtio_unmap(fuse_req_t req, VhostUserFSSlaveMsg *msg); 
+int fuse_virtio_unmap(struct fuse_session *se, VhostUserFSSlaveMsg *msg); 
 
 /**
  * For use with virtio-fs; request synchronisation of part of the cache
