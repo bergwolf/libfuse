@@ -2654,7 +2654,7 @@ void fuse_fs_destroy(struct fuse_fs *fs)
 	free(fs);
 }
 
-static void fuse_lib_destroy(void *data)
+static void fuse_lib_destroy(void *data, struct fuse_session *se)
 {
 	struct fuse *f = (struct fuse *) data;
 

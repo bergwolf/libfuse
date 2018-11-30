@@ -49,7 +49,7 @@ struct cuse_info {
 struct cuse_lowlevel_ops {
 	void (*init) (void *userdata, struct fuse_conn_info *conn);
 	void (*init_done) (void *userdata);
-	void (*destroy) (void *userdata);
+	void (*destroy) (void *userdata, struct fuse_session *se);
 	void (*open) (fuse_req_t req, struct fuse_file_info *fi);
 	void (*read) (fuse_req_t req, size_t size, off_t off,
 		      struct fuse_file_info *fi);
