@@ -218,6 +218,18 @@ static void lo_init(void *userdata,
 
 }
 
+static void lo_destroy(void *userdata, struct fuse_session *se)
+{
+        VhostUserFSSlaveMsg msg = { 0 };
+
+	msg.len[0] = ~(uint64_t)0; /* Special: means 'all' */
+	msg.c_offset[0] = 0;
+        if (fuse_virtio_unmap(se, &msg)) {
+                fprintf(stderr, "%s: unmap during destroy failed\n", __func__);
+        }
+
+}
+
 static int64_t *version_ptr(struct lo_data *lo, struct lo_inode *inode)
 {
 	return lo->version_table + inode->version_offset;
@@ -1644,6 +1656,7 @@ static void lo_removemapping(fuse_req_t req, struct fuse_session *se, fuse_ino_t
 
 static struct fuse_lowlevel_ops lo_oper = {
 	.init		= lo_init,
+	.destroy        = lo_destroy,
 	.lookup		= lo_lookup,
 	.mkdir		= lo_mkdir,
 	.mknod		= lo_mknod,
