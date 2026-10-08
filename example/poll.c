@@ -4,7 +4,7 @@
   Copyright (C) 2008       Tejun Heo <teheo@suse.de>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -21,9 +21,11 @@
  * \include poll.c
  */
 
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 19)
 
 #include <fuse.h>
+#include <fuse_lowlevel.h>  /* for fuse_cmdline_opts */
+#include <fuse_daemonize.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <string.h>
@@ -33,6 +35,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <poll.h>
+#include <stdbool.h>
 
 /*
  * fsel_open_mask is used to limit the number of opens to 1 per file.
@@ -44,13 +47,15 @@ static unsigned fsel_open_mask;
 static const char fsel_hex_map[] = "0123456789ABCDEF";
 static struct fuse *fsel_fuse;	/* needed for poll notification */
 
-#define FSEL_CNT_MAX	10	/* each file can store upto 10 chars */
+#define FSEL_CNT_MAX	10	/* each file can store up to 10 chars */
 #define FSEL_FILES	16
 
-static pthread_mutex_t fsel_mutex;	/* protects notify_mask and cnt array */
+static pthread_mutex_t fsel_mutex;	/* protects the masks, cnt array and fsel_fuse */
 static unsigned fsel_poll_notify_mask;	/* poll notification scheduled? */
 static struct fuse_pollhandle *fsel_poll_handle[FSEL_FILES]; /* poll notify handles */
 static unsigned fsel_cnt[FSEL_FILES];	/* nbytes stored in each file */
+static _Atomic bool fsel_stop = false;
+
 
 static int fsel_path_index(const char *path)
 {
@@ -81,7 +86,9 @@ static int fsel_getattr(const char *path, struct stat *stbuf,
 
 	stbuf->st_mode = S_IFREG | 0444;
 	stbuf->st_nlink = 1;
+	pthread_mutex_lock(&fsel_mutex);
 	stbuf->st_size = fsel_cnt[idx];
+	pthread_mutex_unlock(&fsel_mutex);
 	return 0;
 }
 
@@ -101,7 +108,7 @@ static int fsel_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 	for (i = 0; i < FSEL_FILES; i++) {
 		name[0] = fsel_hex_map[i];
-		filler(buf, name, NULL, 0, 0);
+		filler(buf, name, NULL, 0, FUSE_FILL_DIR_DEFAULTS);
 	}
 
 	return 0;
@@ -115,9 +122,13 @@ static int fsel_open(const char *path, struct fuse_file_info *fi)
 		return -ENOENT;
 	if ((fi->flags & O_ACCMODE) != O_RDONLY)
 		return -EACCES;
-	if (fsel_open_mask & (1 << idx))
+	pthread_mutex_lock(&fsel_mutex);
+	if (fsel_open_mask & (1 << idx)) {
+		pthread_mutex_unlock(&fsel_mutex);
 		return -EBUSY;
+	}
 	fsel_open_mask |= (1 << idx);
+	pthread_mutex_unlock(&fsel_mutex);
 
 	/*
 	 * fsel files are nonseekable somewhat pipe-like files which
@@ -137,7 +148,9 @@ static int fsel_release(const char *path, struct fuse_file_info *fi)
 
 	(void) path;
 
+	pthread_mutex_lock(&fsel_mutex);
 	fsel_open_mask &= ~(1 << idx);
+	pthread_mutex_unlock(&fsel_mutex);
 	return 0;
 }
 
@@ -174,13 +187,12 @@ static int fsel_poll(const char *path, struct fuse_file_info *fi,
 	 * happens only after poll is called, fill it here from
 	 * fuse_context.
 	 */
+	pthread_mutex_lock(&fsel_mutex);
 	if (!fsel_fuse) {
 		struct fuse_context *cxt = fuse_get_context();
 		if (cxt)
 			fsel_fuse = cxt->fuse;
 	}
-
-	pthread_mutex_lock(&fsel_mutex);
 
 	if (ph != NULL) {
 		struct fuse_pollhandle *oldph = fsel_poll_handle[idx];
@@ -220,7 +232,7 @@ static void *fsel_producer(void *data)
 
 	(void) data;
 
-	while (1) {
+	while (!fsel_stop) {
 		int i, t;
 
 		pthread_mutex_lock(&fsel_mutex);
@@ -263,9 +275,12 @@ static void *fsel_producer(void *data)
 
 int main(int argc, char *argv[])
 {
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+	struct fuse_cmdline_opts opts;
+	struct fuse_loop_config *config;
 	pthread_t producer;
-	pthread_attr_t attr;
-	int ret;
+	struct fuse *fuse;
+	int res;
 
 	errno = pthread_mutex_init(&fsel_mutex, NULL);
 	if (errno) {
@@ -273,22 +288,85 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	errno = pthread_attr_init(&attr);
-	if (errno) {
-		perror("pthread_attr_init");
+	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
+
+	if (opts.show_version) {
+		printf("FUSE library version %s\n", fuse_pkgversion());
+		fuse_lowlevel_version();
+		res = 0;
+		goto out1;
+	} else if (opts.show_help) {
+		printf("usage: %s [options] <mountpoint>\n\n", argv[0]);
+		fuse_cmdline_help();
+		fuse_lib_help(&args);
+		res = 0;
+		goto out1;
+	} else if (!opts.mountpoint) {
+		fprintf(stderr, "error: no mountpoint specified\n");
+		res = 1;
+		goto out1;
 	}
 
-	errno = pthread_create(&producer, &attr, fsel_producer, NULL);
+	fuse = fuse_new(&args, &fsel_oper, sizeof(fsel_oper), NULL);
+	if (fuse == NULL) {
+		res = 1;
+		goto out1;
+	}
+
+	if (fuse_daemonize_early_start(opts.foreground ?
+				       FUSE_DAEMONIZE_NO_BACKGROUND : 0) != 0) {
+		res = 1;
+		goto out2;
+	}
+
+	if (fuse_mount(fuse, opts.mountpoint) != 0) {
+		res = 1;
+		goto out2;
+	}
+
+	fuse_daemonize_early_success();
+
+	errno = pthread_create(&producer, NULL, fsel_producer, NULL);
 	if (errno) {
 		perror("pthread_create");
-		return 1;
+		res = 1;
+		goto out3;
 	}
 
-	ret = fuse_main(argc, argv, &fsel_oper, NULL);
+	if (fuse_set_signal_handlers(fuse_get_session(fuse)) != 0) {
+		res = 1;
+		goto out4;
+	}
 
-	pthread_cancel(producer);
+	if (opts.singlethread)
+		res = fuse_loop(fuse);
+	else {
+		config = fuse_loop_cfg_create();
+		if (config == NULL) {
+			res = 1;
+			goto out5;
+		}
+		fuse_loop_cfg_set_clone_fd(config, opts.clone_fd);
+		fuse_loop_cfg_set_idle_threads(config, opts.max_idle_threads);
+		res = fuse_loop_mt(fuse, config);
+		fuse_loop_cfg_destroy(config);
+	}
+	if (res)
+		res = 1;
+
+out5:
+	fuse_remove_signal_handlers(fuse_get_session(fuse));
+out4:
+	/* the producer sends notifications on the fd that fuse_unmount() closes */
+	fsel_stop = true;
 	pthread_join(producer, NULL);
-
-	return ret;
+out3:
+	fuse_unmount(fuse);
+out2:
+	fuse_destroy(fuse);
+out1:
+	free(opts.mountpoint);
+	fuse_opt_free_args(&args);
+	return res;
 }

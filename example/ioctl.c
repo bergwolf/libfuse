@@ -4,7 +4,7 @@
   Copyright (C) 2008       Tejun Heo <teheo@suse.de>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -181,9 +181,9 @@ static int fioc_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if (fioc_file_type(path) != FIOC_ROOT)
 		return -ENOENT;
 
-	filler(buf, ".", NULL, 0, 0);
-	filler(buf, "..", NULL, 0, 0);
-	filler(buf, FIOC_NAME, NULL, 0, 0);
+	filler(buf, ".", NULL, 0, FUSE_FILL_DIR_DEFAULTS);
+	filler(buf, "..", NULL, 0, FUSE_FILL_DIR_DEFAULTS);
+	filler(buf, FIOC_NAME, NULL, 0, FUSE_FILL_DIR_DEFAULTS);
 
 	return 0;
 }

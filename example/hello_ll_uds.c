@@ -4,7 +4,7 @@
   Copyright (C) 2022  Tofik Sonono <tofik.sonono@intel.com>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -20,7 +20,7 @@
  * \include hello_ll.c
  */
 
-#define FUSE_USE_VERSION 34
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 19)
 
 
 #ifndef _GNU_SOURCE
@@ -41,6 +41,19 @@
 
 static const char *hello_str = "Hello World!\n";
 static const char *hello_name = "hello";
+
+#define DEFAULT_SOCKET_PATH "/tmp/libfuse-hello-ll.sock"
+
+static struct options {
+	const char *socket_path;
+} options;
+
+#define OPTION(t, p)                           \
+	{ t, offsetof(struct options, p), 1 }
+static const struct fuse_opt option_spec[] = {
+	OPTION("--socket=%s", socket_path),
+	FUSE_OPT_END
+};
 
 static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
 {
@@ -75,6 +88,14 @@ static void hello_ll_getattr(fuse_req_t req, fuse_ino_t ino,
 		fuse_reply_err(req, ENOENT);
 	else
 		fuse_reply_attr(req, &stbuf, 1.0);
+}
+
+static void hello_ll_init(void *userdata, struct fuse_conn_info *conn)
+{
+	(void)userdata;
+
+	/* Disable the receiving and processing of FUSE_INTERRUPT requests */
+	fuse_set_conn_flag(conn, FUSE_CONN_FLAG_NO_INTERRUPT);
 }
 
 static void hello_ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -164,6 +185,7 @@ static void hello_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 }
 
 static const struct fuse_lowlevel_ops hello_ll_oper = {
+	.init           = hello_ll_init,
 	.lookup		= hello_ll_lookup,
 	.getattr	= hello_ll_getattr,
 	.readdir	= hello_ll_readdir,
@@ -176,8 +198,8 @@ static int create_socket(const char *socket_path) {
 
 	if (strnlen(socket_path, sizeof(addr.sun_path)) >=
 		sizeof(addr.sun_path)) {
-		printf("Socket path may not be longer than %lu characters\n",
-			 sizeof(addr.sun_path) - 1);
+		printf("Socket path may not be longer than %zu characters\n",
+		       sizeof(addr.sun_path) - 1);
 		return -1;
 	}
 
@@ -297,7 +319,9 @@ static void fuse_cmdline_help_uds(void)
 {
 	printf("    -h   --help            print help\n"
 	       "    -V   --version         print version\n"
-	       "    -d   -o debug          enable debug output (implies -f)\n");
+	       "    -d   -o debug          enable debug output (implies -f)\n"
+	       "    --socket=PATH          serve on PATH\n"
+	       "                           (default: " DEFAULT_SOCKET_PATH ")\n");
 }
 
 int main(int argc, char *argv[])
@@ -314,6 +338,13 @@ int main(int argc, char *argv[])
 	int cfd = -1;
 	int ret = -1;
 
+	/* strdup: fuse_opt_parse frees the old value if --socket is given */
+	options.socket_path = strdup(DEFAULT_SOCKET_PATH);
+	if (options.socket_path == NULL)
+		return 1;
+
+	if (fuse_opt_parse(&args, &options, option_spec, NULL) == -1)
+		return 1;
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
 	if (opts.show_help) {
@@ -337,11 +368,11 @@ int main(int argc, char *argv[])
 	if (fuse_set_signal_handlers(se) != 0)
 	    goto err_out2;
 
-	cfd = create_socket("/tmp/libfuse-hello-ll.sock");
+	cfd = create_socket(options.socket_path);
 	if (cfd == -1)
 		goto err_out3;
 
-	if (fuse_session_custom_io(se, &io, cfd) != 0)
+	if (fuse_session_custom_io(se, &io, sizeof(io), cfd) != 0)
 		goto err_out3;
 
 	/* Block until ctrl+c */

@@ -5,21 +5,21 @@
   Architecture specific file system mounting (FreeBSD).
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB.
+  See the file LGPL2.txt.
 */
 
-#include "config.h"
+#include "fuse_config.h"
 #include "fuse_i.h"
+#include "mount_common_i.h"
 #include "fuse_misc.h"
 #include "fuse_opt.h"
+#include "util.h"
 
 #include <sys/param.h>
 #include <sys/mount.h>
+#include "fuse_mount_compat.h"
 
-#include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/sysctl.h>
-#include <sys/user.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -27,11 +27,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
-#include <paths.h>
-#include <limits.h>
+#include <spawn.h>
 
 #define FUSERMOUNT_PROG		"mount_fusefs"
+#define FUSERMOUNT_PATH		"/sbin/" FUSERMOUNT_PROG
 #define FUSE_DEV_TRUNK		"/dev/fuse"
+
+#ifndef HAVE_ENVIRON_DECL
+extern char **environ __weak_symbol;
+#endif
 
 enum {
 	KEY_RO,
@@ -85,9 +89,11 @@ static const struct fuse_opt fuse_mount_opts[] = {
 	FUSE_DUAL_OPT_KEY("private",		KEY_KERN),
 	FUSE_DUAL_OPT_KEY("neglect_shares",	KEY_KERN),
 	FUSE_DUAL_OPT_KEY("push_symlinks_in",	KEY_KERN),
-	FUSE_OPT_KEY("nosync_unmount",		KEY_KERN),
 #if __FreeBSD_version >= 1200519
 	FUSE_DUAL_OPT_KEY("intr",		KEY_KERN),
+#endif
+#if __FreeBSD_version >= 1300048
+	FUSE_DUAL_OPT_KEY("nocover",		KEY_KERN),
 #endif
 	/* stock FBSD mountopt parsing routine lets anything be negated... */
 	/*
@@ -103,7 +109,7 @@ void fuse_mount_version(void)
 	system(FUSERMOUNT_PROG " --version");
 }
 
-unsigned get_max_read(struct mount_opts *o)
+unsigned int get_max_read(const struct mount_opts *o)
 {
 	return o->max_read;
 }
@@ -129,47 +135,27 @@ static int fuse_mount_opt_proc(void *data, const char *arg, int key,
 
 void fuse_kern_unmount(const char *mountpoint, int fd)
 {
-	close(fd);
-	unmount(mountpoint, MNT_FORCE);
+	if (close(fd) < 0)
+		fuse_log(FUSE_LOG_WARNING, "closing FD %d failed: %s\n", fd, strerror(errno));
+	if (unmount(mountpoint, MNT_FORCE) < 0)
+		fuse_log(FUSE_LOG_ERR, "unmounting %s failed: %s\n",
+			 mountpoint, strerror(errno));
 }
-
-/* Check if kernel is doing init in background */
-static int init_backgrounded(void)
-{
-	unsigned ibg;
-	size_t len;
-
-	len = sizeof(ibg);
-
-	if (sysctlbyname("vfs.fuse.init_backgrounded", &ibg, &len, NULL, 0))
-		return 0;
-
-	return ibg;
-}
-
 
 static int fuse_mount_core(const char *mountpoint, const char *opts)
 {
-	const char *mountprog = FUSERMOUNT_PROG;
-	int fd;
+	long fd;
 	char *fdnam, *dev;
-	pid_t pid, cpid;
-	int status;
+	int err;
 
 	fdnam = getenv("FUSE_DEV_FD");
 
 	if (fdnam) {
-		char *ep;
-
-		fd = strtol(fdnam, &ep, 10);
-
-		if (*ep != '\0') {
+		err = libfuse_strtol(fdnam, &fd);
+		if (err || fd < 0) {
 			fuse_log(FUSE_LOG_ERR, "invalid value given in FUSE_DEV_FD\n");
 			return -1;
 		}
-
-		if (fd < 0)
-			return -1;
 
 		goto mount;
 	}
@@ -186,75 +172,69 @@ static int fuse_mount_core(const char *mountpoint, const char *opts)
 
 mount:
 	if (getenv("FUSE_NO_MOUNT") || ! mountpoint)
-		goto out;
+		return fd;
 
-	pid = fork();
-	cpid = pid;
-
-	if (pid == -1) {
-		perror("fuse: fork() failed");
-		close(fd);
-		return -1;
-	}
-
-	if (pid == 0) {
-		if (! init_backgrounded()) {
-			/*
-			 * If init is not backgrounded, we have to
-			 * call the mount util backgrounded, to avoid
-			 * deadlock.
-			 */
-
-			pid = fork();
-
-			if (pid == -1) {
-				perror("fuse: fork() failed");
-				close(fd);
-				exit(1);
-			}
+	_Bool fdnam_alloc = 0;
+	if (!fdnam) {
+		err = asprintf(&fdnam, "%ld", fd);
+		if (err < 0) {
+			perror("fuse: failed to assemble mount arguments for " FUSERMOUNT_PROG);
+			goto err_out;
 		}
-
-		if (pid == 0) {
-			const char *argv[32];
-			int a = 0;
-			int ret = -1; 
-			
-			if (! fdnam)
-			{
-				ret = asprintf(&fdnam, "%d", fd); 
-				if(ret == -1)
-				{
-					perror("fuse: failed to assemble mount arguments");
-					close(fd);
-					exit(1);
-				}
-			}
-
-			argv[a++] = mountprog;
-			if (opts) {
-				argv[a++] = "-o";
-				argv[a++] = opts;
-			}
-			argv[a++] = fdnam;
-			argv[a++] = mountpoint;
-			argv[a++] = NULL;
-			execvp(mountprog, (char **) argv);
-			perror("fuse: failed to exec mount program");
-			free(fdnam);
-			exit(1);
-		}
-
-		exit(0);
+		fdnam_alloc = 1;
 	}
 
-	if (waitpid(cpid, &status, 0) == -1 || WEXITSTATUS(status) != 0) {
-		perror("fuse: failed to mount file system");
-		close(fd);
-		return -1;
+	const char *argv[6];
+	unsigned char a = 0;
+
+	argv[a++] = FUSERMOUNT_PROG;
+	if (opts) {
+		argv[a++] = "-o";
+		argv[a++] = opts;
+	}
+	argv[a++] = fdnam;
+	argv[a++] = mountpoint;
+	argv[a] = NULL;
+
+	pid_t pid;
+
+	int status = posix_spawn(&pid, FUSERMOUNT_PATH, NULL, NULL, (char *const *) argv, environ);
+
+	if (fdnam_alloc)
+		free(fdnam);
+
+	if (status) {
+		fuse_log(FUSE_LOG_CRIT, "spawning " FUSERMOUNT_PROG " failed: %s (%d)\n",
+			 strerror(status), status);
+		goto err_out;
 	}
 
-out:
+	do
+		err = waitpid(pid, &status, 0);
+	while (err < 0 && errno == EINTR);
+
+	if (err < 0) {
+		fuse_log(FUSE_LOG_ERR, "waiting for " FUSERMOUNT_PROG " failed: %s\n",
+			 strerror(errno));
+		goto err_out;
+	}
+
+	if (WIFEXITED(status) && WEXITSTATUS(status)) {
+		fuse_log(FUSE_LOG_ERR, FUSERMOUNT_PROG " exited with code %d\n",
+			 WEXITSTATUS(status));
+		goto err_out;
+	}
+	if (WIFSIGNALED(status)) {
+		fuse_log(FUSE_LOG_ERR, FUSERMOUNT_PROG " was killed by %s\n",
+			 strsignal(WTERMSIG(status)));
+		goto err_out;
+	}
+
 	return fd;
+
+err_out:
+	(void)close(fd);
+	return -1;
 }
 
 struct mount_opts *parse_mount_opts(struct fuse_args *args)

@@ -3,7 +3,7 @@
   Copyright (C) 2017 Nikolaus Rath <Nikolaus@rath.org>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -19,7 +19,7 @@
  * \include printcap.c
  */
 
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 19)
 
 #include <fuse_lowlevel.h>
 #include <stdio.h>
@@ -27,60 +27,27 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "fuse_cap_names_i.h"
+
 struct fuse_session *se;
 
-static void pc_init(void *userdata,
-		    struct fuse_conn_info *conn)
+static void print_capabilities(struct fuse_conn_info *conn)
+{
+	printf("Capabilities:\n");
+	for (const struct fuse_cap_name *cap = fuse_cap_names; cap->name != NULL; cap++) {
+		if (fuse_get_feature_flag(conn, cap->flag)) {
+			printf("\t%s\n", cap->name);
+		}
+	}
+}
+
+static void pc_init(void *userdata, struct fuse_conn_info *conn)
 {
 	(void) userdata;
-	
+
 	printf("Protocol version: %d.%d\n", conn->proto_major,
 	       conn->proto_minor);
-	printf("Capabilities:\n");
-	if(conn->capable & FUSE_CAP_ASYNC_READ)
-			printf("\tFUSE_CAP_ASYNC_READ\n");
-	if(conn->capable & FUSE_CAP_POSIX_LOCKS)
-			printf("\tFUSE_CAP_POSIX_LOCKS\n");
-	if(conn->capable & FUSE_CAP_ATOMIC_O_TRUNC)
-			printf("\tFUSE_CAP_ATOMIC_O_TRUNC\n");
-	if(conn->capable & FUSE_CAP_EXPORT_SUPPORT)
-			printf("\tFUSE_CAP_EXPORT_SUPPORT\n");
-	if(conn->capable & FUSE_CAP_DONT_MASK)
-			printf("\tFUSE_CAP_DONT_MASK\n");
-	if(conn->capable & FUSE_CAP_SPLICE_MOVE)
-			printf("\tFUSE_CAP_SPLICE_MOVE\n");
-	if(conn->capable & FUSE_CAP_SPLICE_READ)
-			printf("\tFUSE_CAP_SPLICE_READ\n");
-	if(conn->capable & FUSE_CAP_SPLICE_WRITE)
-			printf("\tFUSE_CAP_SPLICE_WRITE\n");
-	if(conn->capable & FUSE_CAP_FLOCK_LOCKS)
-			printf("\tFUSE_CAP_FLOCK_LOCKS\n");
-	if(conn->capable & FUSE_CAP_IOCTL_DIR)
-			printf("\tFUSE_CAP_IOCTL_DIR\n");
-	if(conn->capable & FUSE_CAP_AUTO_INVAL_DATA)
-			printf("\tFUSE_CAP_AUTO_INVAL_DATA\n");
-	if(conn->capable & FUSE_CAP_READDIRPLUS)
-			printf("\tFUSE_CAP_READDIRPLUS\n");
-	if(conn->capable & FUSE_CAP_READDIRPLUS_AUTO)
-			printf("\tFUSE_CAP_READDIRPLUS_AUTO\n");
-	if(conn->capable & FUSE_CAP_ASYNC_DIO)
-			printf("\tFUSE_CAP_ASYNC_DIO\n");
-	if(conn->capable & FUSE_CAP_WRITEBACK_CACHE)
-			printf("\tFUSE_CAP_WRITEBACK_CACHE\n");
-	if(conn->capable & FUSE_CAP_NO_OPEN_SUPPORT)
-			printf("\tFUSE_CAP_NO_OPEN_SUPPORT\n");
-	if(conn->capable & FUSE_CAP_PARALLEL_DIROPS)
-			printf("\tFUSE_CAP_PARALLEL_DIROPS\n");
-	if(conn->capable & FUSE_CAP_POSIX_ACL)
-			printf("\tFUSE_CAP_POSIX_ACL\n");
-	if(conn->capable & FUSE_CAP_CACHE_SYMLINKS)
-			printf("\tFUSE_CAP_CACHE_SYMLINKS\n");
-	if(conn->capable & FUSE_CAP_NO_OPENDIR_SUPPORT)
-			printf("\tFUSE_CAP_NO_OPENDIR_SUPPORT\n");
-	if(conn->capable & FUSE_CAP_EXPLICIT_INVAL_DATA)
-			printf("\tFUSE_CAP_EXPLICIT_INVAL_DATA\n");
-	if(conn->capable & FUSE_CAP_EXPIRE_ONLY)
-			printf("\tFUSE_CAP_EXPIRE_ONLY\n");
+	print_capabilities(conn);
 	fuse_session_exit(se);
 }
 
@@ -100,7 +67,7 @@ int main(int argc, char **argv)
 		perror("mkdtemp");
 		return 1;
 	}
-	
+
 	printf("FUSE library version %s\n", fuse_pkgversion());
 	fuse_lowlevel_version();
 

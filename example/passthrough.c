@@ -4,7 +4,7 @@
   Copyright (C) 2011       Sebastian Pipping <sebastian@pipping.org>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -23,7 +23,7 @@
  */
 
 
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 18)
 
 #define _GNU_SOURCE
 
@@ -40,10 +40,6 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
-#ifdef __FreeBSD__
-#include <sys/socket.h>
-#include <sys/un.h>
-#endif
 #include <sys/time.h>
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
@@ -52,12 +48,22 @@
 #include "passthrough_helpers.h"
 
 static int fill_dir_plus = 0;
+static int readdir_zero_ino;
 
 static void *xmp_init(struct fuse_conn_info *conn,
 		      struct fuse_config *cfg)
 {
-	(void) conn;
-	cfg->use_ino = 1;
+	/* Always replies inline on the io-uring worker thread */
+	fuse_set_conn_flag(conn, FUSE_CONN_FLAG_SINGLE_ISSUER);
+
+	cfg->use_ino = !readdir_zero_ino;
+
+	/* parallel_direct_writes feature depends on direct_io features.
+	   To make parallel_direct_writes valid, need either set cfg->direct_io
+	   in current function (recommended in high level API) or set fi->direct_io
+	   in xmp_create() or xmp_open(). */
+	// cfg->direct_io = 1;
+	   cfg->parallel_direct_writes = 1;
 
 	/* Pick up changes from lower filesystem right away. This is
 	   also necessary for better hardlink support. When the kernel
@@ -66,9 +72,11 @@ static void *xmp_init(struct fuse_conn_info *conn,
 	   the cache of the associated inode - resulting in an
 	   incorrect st_nlink value being reported for any remaining
 	   hardlinks to this inode. */
-	cfg->entry_timeout = 0;
-	cfg->attr_timeout = 0;
-	cfg->negative_timeout = 0;
+	if (!cfg->auto_cache) {
+		cfg->entry_timeout = 0;
+		cfg->attr_timeout = 0;
+		cfg->negative_timeout = 0;
+	}
 
 	return NULL;
 }
@@ -127,9 +135,16 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 	while ((de = readdir(dp)) != NULL) {
 		struct stat st;
-		memset(&st, 0, sizeof(st));
-		st.st_ino = de->d_ino;
-		st.st_mode = de->d_type << 12;
+		if (fill_dir_plus) {
+			fstatat(dirfd(dp), de->d_name, &st,
+				AT_SYMLINK_NOFOLLOW);
+		} else {
+			memset(&st, 0, sizeof(st));
+			st.st_ino = de->d_ino;
+			st.st_mode = de->d_type << 12;
+		}
+		if (readdir_zero_ino)
+			st.st_ino = 0;
 		if (filler(buf, de->d_name, &st, 0, fill_dir_plus))
 			break;
 	}
@@ -292,9 +307,25 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 
+#ifdef __FreeBSD__
+	/* During buffered write, the kernel may issue a READ request. */
+	if (!(fi->flags & O_DIRECT) && (fi->flags & O_ACCMODE) == O_WRONLY) {
+		fi->flags &= ~O_ACCMODE;
+		fi->flags |= O_RDWR;
+	}
+#endif
+
 	res = open(path, fi->flags);
 	if (res == -1)
 		return -errno;
+
+        /* Enable direct_io when open has flags O_DIRECT to enjoy the feature
+        parallel_direct_writes (i.e., to get a shared lock, not exclusive lock,
+        for writes to the same file). */
+	if (fi->flags & O_DIRECT) {
+		fi->direct_io = 1;
+		fi->parallel_direct_writes = 1;
+	}
 
 	fi->fh = res;
 	return 0;
@@ -377,7 +408,6 @@ static int xmp_fsync(const char *path, int isdatasync,
 	return 0;
 }
 
-#ifdef HAVE_POSIX_FALLOCATE
 static int xmp_fallocate(const char *path, int mode,
 			off_t offset, off_t length, struct fuse_file_info *fi)
 {
@@ -385,9 +415,6 @@ static int xmp_fallocate(const char *path, int mode,
 	int res;
 
 	(void) fi;
-
-	if (mode)
-		return -EOPNOTSUPP;
 
 	if(fi == NULL)
 		fd = open(path, O_WRONLY);
@@ -397,13 +424,12 @@ static int xmp_fallocate(const char *path, int mode,
 	if (fd == -1)
 		return -errno;
 
-	res = -posix_fallocate(fd, offset, length);
+	res = do_fallocate(fd, mode, offset, length);
 
 	if(fi == NULL)
 		close(fd);
 	return res;
 }
-#endif
 
 #ifdef HAVE_SETXATTR
 /* xattr operations are optional and can safely be left unimplemented */
@@ -506,6 +532,24 @@ static off_t xmp_lseek(const char *path, off_t off, int whence, struct fuse_file
 	return res;
 }
 
+#ifdef HAVE_STATX
+static int xmp_statx(const char *path, int flags, int mask, struct statx *stxbuf,
+		     struct fuse_file_info *fi)
+{
+	int fd = -1;
+	int res;
+
+	if (fi)
+		fd = fi->fh;
+
+	res = statx(fd, path, flags | AT_SYMLINK_NOFOLLOW, mask, stxbuf);
+	if (res == -1)
+		return -errno;
+
+	return 0;
+}
+#endif
+
 static const struct fuse_operations xmp_oper = {
 	.init           = xmp_init,
 	.getattr	= xmp_getattr,
@@ -532,9 +576,7 @@ static const struct fuse_operations xmp_oper = {
 	.statfs		= xmp_statfs,
 	.release	= xmp_release,
 	.fsync		= xmp_fsync,
-#ifdef HAVE_POSIX_FALLOCATE
 	.fallocate	= xmp_fallocate,
-#endif
 #ifdef HAVE_SETXATTR
 	.setxattr	= xmp_setxattr,
 	.getxattr	= xmp_getxattr,
@@ -545,6 +587,9 @@ static const struct fuse_operations xmp_oper = {
 	.copy_file_range = xmp_copy_file_range,
 #endif
 	.lseek		= xmp_lseek,
+#ifdef HAVE_STATX
+	.statx		= xmp_statx,
+#endif
 };
 
 int main(int argc, char *argv[])
@@ -558,6 +603,9 @@ int main(int argc, char *argv[])
 	for (i=0, new_argc=0; (i<argc) && (new_argc<MAX_ARGS); i++) {
 		if (!strcmp(argv[i], "--plus")) {
 			fill_dir_plus = FUSE_FILL_DIR_PLUS;
+		} else if (!strcmp(argv[i], "--readdir-zero-inodes")) {
+			// Return zero inodes from readdir
+			readdir_zero_ino = 1;
 		} else {
 			new_argv[new_argc++] = argv[i];
 		}

@@ -5,18 +5,18 @@
   Implementation of the single-threaded FUSE session loop.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB
+  See the file LGPL2.txt
 */
 
 #include "fuse_config.h"
 #include "fuse_lowlevel.h"
 #include "fuse_i.h"
-
+#include "fuse_uring_i.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 
-int fuse_session_loop(struct fuse_session *se)
+int fuse_session_loop_30(struct fuse_session *se)
 {
 	int res = 0;
 	struct fuse_buf fbuf = {
@@ -24,23 +24,56 @@ int fuse_session_loop(struct fuse_session *se)
 	};
 
 	while (!fuse_session_exited(se)) {
-		res = fuse_session_receive_buf_int(se, &fbuf, NULL);
+		res = fuse_session_receive_buf_internal(se, &fbuf, NULL);
 
 		if (res == -EINTR)
 			continue;
 		if (res <= 0)
 			break;
 
-		fuse_session_process_buf_int(se, &fbuf, NULL);
+		fuse_session_process_buf(se, &fbuf);
 	}
 
-	free(fbuf.mem);
+	fuse_buf_free(&fbuf);
 	if(res > 0)
 		/* No error, just the length of the most recently read
 		   request */
 		res = 0;
 	if(se->error != 0)
 		res = se->error;
-	fuse_session_reset(se);
+
+	if (se->uring.pool)
+		fuse_uring_stop(se);
 	return res;
+}
+
+/*
+ * A single worker thread instead of the caller's thread, so that
+ * fuse_session_exit() wakes the loop up.
+ */
+int fuse_session_loop_319(struct fuse_session *se)
+{
+	int err;
+	struct fuse_loop_config *config = fuse_loop_cfg_create();
+
+	if (config == NULL)
+		return -ENOMEM;
+
+	fuse_loop_cfg_set_max_threads(config, 1);
+	err = fuse_session_loop_mt_312(se, config);
+	fuse_loop_cfg_destroy(config);
+
+	return err;
+}
+
+/*
+ * ABI compat: filesystems built before 3.19 link this bare name and expect the
+ * caller's thread to serve the requests.
+ */
+#undef fuse_session_loop
+
+int fuse_session_loop(struct fuse_session *se);
+int fuse_session_loop(struct fuse_session *se)
+{
+	return fuse_session_loop_30(se);
 }

@@ -22,3 +22,23 @@ option('tests', type : 'boolean', value : true,
 option('disable-libc-symbol-version', type : 'boolean', value : false,
        description: 'Disable versioned symbols through libc')
 
+option('enable-usdt', type : 'boolean', value : false,
+       description: 'Enable user statically defined tracepoints for extra observability')
+
+option('enable-io-uring', type: 'boolean', value: true,
+       description: 'Enable fuse-over-io-uring support')
+
+option('enable-custom-io', type: 'boolean', value: false,
+       description: 'Enable fuse_session_custom_io(), which serves the protocol over a caller-provided fd instead of /dev/fuse. The peer might not be a kernel and can forge requests that libfuse parses without bounds checks, crashing or corrupting the filesystem process - see doc/README.custom-io')
+
+option('sync-init', type: 'combo', choices: ['auto', 'always', 'never'], value: 'auto',
+       description: 'Synchronous FUSE_INIT: auto follows fuse_daemonize_early_start(), always and never override it')
+
+option('service-socket-dir', type : 'string', value : '',
+       description: 'Where to install fuse server sockets (if empty, /run/fuse)')
+
+option('service-socket-perms', type : 'string', value : '',
+       description: 'Default fuse server socket permissions (if empty, 0220)')
+
+option('systemd-system-unit-dir', type : 'string', value : '',
+       description: 'Where to install systemd unit files (if empty, query pkg-config(1))')

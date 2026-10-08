@@ -1,3 +1,221 @@
+Unreleased Changes
+==================
+
+* ``fuse_session_custom_io()`` is disabled unless libfuse is built with
+  ``-Denable-custom-io=true``, and returns ``-ENOTSUP`` otherwise. The
+  ``hello_ll_uds`` example is built only with that option, and enabling it
+  warns at configure time.
+  Reason is a custom io peer might not be a kernel and can
+  forge requests that libfuse parses without bounds checks, crashing or
+  corrupting the filesystem process. See ``doc/README.custom-io``.
+
+* ``fusermount3`` no longer accepts several time stamp related mount options
+  (`atime, diratime, relatime, strictatime, lazytime and
+  nolazytime`). These were added in 3.14.1 by commits
+  1e66c92153d4 ("Add more time mount options") and 81ad52c7dbed ("Add
+  more time mount options to fusermount / fix lazytime"), then dropped
+  again from the library in 3.15 by dba6b3983af3 ("Do not pass
+  unsupported mount options to the kernel"), because for FUSE the
+  filesystem daemon and not the kernel implements atime updates.
+  Left over in fusermount3 was unintended.
+
+* ``fusermount3`` no longer accepts ``-o large_read``; passing it is now
+  an error instead of printing a deprecation notice and ignoring the
+  option. Relevant only for Linux 2.4 kernels, it was dropped from the
+  library in 3.0 by commit d6217bb2a045 ("Drop -o large_read mount
+  option") and from fusermount by 235e9a1f80cb ("fusermout: Remove the
+  large read check").
+
+* ``fuse_session_loop()`` built with FUSE_USE_VERSION 319 or higher calls the
+  filesystem from a worker thread, no longer from the thread that entered the
+  loop. Requests are still handled one at a time. Thread local state has to be
+  set up in a callback instead of before entering the loop.
+
+* ``fuse_session_loop()`` below FUSE_USE_VERSION 319 is deprecated and warns
+  at compile time.
+
+* With ``FUSE_CAP_HANDLE_KILLPRIV_V2`` enabled, ``open``, ``create``,
+  ``write`` and ``write_buf`` now get the kernel's per request kill
+  suid/sgid indication in the new ``fuse_file_info::kill_suidgid`` field.
+  Before, only ``setattr`` saw it, through ``FUSE_SET_ATTR_KILL_SUID``.
+
+* Add support for fuse uring buffer pools (``-o io_uring_bufpool``). Instead
+  of every ring entry registering a payload buffer of its own, userspace hands
+  the kernel one contiguous region of memory for the queue and the kernel
+  manages/optimizes the memory usage for the queue.
+
+
+libfuse 3.18.0 (2025-12-18)
+===========================
+
+New Features
+------------
+
+* fuse-over-io-uring communication
+* statx support
+* Request timeouts: Prevent hung operations
+* FUSE_NOTIFY_INC_EPOCH: New notification mechanism for epoch counters
+
+Important Fixes
+----------------
+
+* Fixed double unmount on FUSE_DESTROY
+* Fixed junk readdirplus results when filesystem doesn't fill stat info
+* Fixed memory deallocation in fuse_session_loop_remember
+* Fixed COPY_FILE_RANGE interface
+
+Platform Support
+----------------
+
+* Improved FreeBSD support (mount error reporting, test runner, build fixes)
+* Fixed 32-bit architecture builds
+* Fixed build with musl libc and older kernels (< 5.9)
+
+Other Improvements
+------------------
+
+* Added PanFS to fusermount whitelist
+* Thread naming support for easier debugging
+
+
+libfuse 3.17.4 (2025-08-19)
+===========================
+- Try to detect mount-utils by checking for /run/mount/utab
+  and don't try to update mtab if it does not exist
+- Fix a build warning when HAVE_BACKTRACE is undefined
+- fuse_loop_mt.c: fix close-on-exec flag on clone fd
+- Remove struct size assertions from fuse_common.h
+
+libfuse 3.17.3 (2025-07-16)
+===========================
+* more conn->want / conn->want_ext conversion fixes
+* Fix feature detection for close_range
+* Avoid double unmount on FUSE_DESTROY
+
+libfuse 3.17.2 (2025-04-23)
+===========================
+* Fixed uninitized bufsize value (compilation warning and real
+  issue when HAVE_SPLICE was not defined)
+* Fixed initialization races related to buffer realocation when
+  large buf sizes are used (/proc/sys/fs/fuse/max_pages_limit)
+* Fix build with kernel < 5.9
+* Fix static_assert build failure with C++ version < 11
+* Compilation fix (remove second fuse_main_real_versioned declaration)
+* Another conn.want flag conversion fix for high-level applications
+* Check if pthread_setname_np() exists before use it
+* fix example/memfs_ll rename deadlock error
+* signal handlers: Store fuse_session unconditionally and restore
+  previous behavior that with multiple sessions the last session
+  was used for the signal exist handler
+
+libfuse 3.17.1 (2025-03-24)
+===========================
+* fuse: Fix want conn.want flag conversion
+* Prevent re-usage of stdio FDs for fusermount
+* PanFS added to fusermount whitelist
+
+libfuse 3.17.1-rc1 (2025-02-18)
+===============================
+* several BSD fixes
+* x86 (32bit) build fixes
+* nested declarations moved out of the inlined functions to avoid
+  build warnings
+* signify public key added for future 3.18
+
+libfuse 3.17.1-rc0 (2025-02.10)
+===============================
+
+* Fix libfuse build with FUSE_USE_VERSION 30
+* Fix build of memfs_ll without manual meson reconfigure
+* Fix junk readdirplus results when filesystem not filling stat info
+* Fix conn.want_ext truncation to 32bit
+* Fix some build warnings with -Og
+* Fix fuse_main_real symbols
+* Several changes related to functions/symbols that added in
+  the libfuse version in 3.17
+* Add thread names to libfuse threads
+* With auto-umounts the FUSE_COMMFD2 (parent process fd is
+  exported to be able to silence leak checkers
+
+
+libfuse 3.17 (2025-01-01, not officially releaesed)
+==================================================
+
+* 3.11 and 3.14.2 introduced ABI incompatibilities, the ABI is restored
+  to 3.10, .so version was increased since there were releases with
+  the incompatible ABI
+
+* The libfuse version a program was compiled against is now encoded into
+  that program, using inlined functions in fuse_lowlevel.h and fuse.h
+* Allows to handle fatal signals and to print a backtrace.
+  New API function: fuse_set_fail_signal_handlers()
+
+* Allows fuse_log() messages to be send to syslog instead of stderr
+  New API functions: fuse_log_enable_syslog() and fuse_log_close_syslog()
+
+* Handle buffer misalignment for FUSE_WRITE
+
+* Added support for filesystem passthrough read/write of files when
+  FUSE_PASSTHROUGH capability is enabled
+  New API functions:  fuse_passthrough_open() and fuse_passthrough_close(),
+                      also see example/passthrough_hp.cc
+
+* Added fmask and dmask options to high-level API
+  - dmask: umask applied to directories
+  - fmask: umask applied to non-directories
+
+* Added FUSE_FILL_DIR_DEFAULTS enum to support C++ programs using
+  fuse_fill_dir_t function
+
+* Added support for FUSE_CAP_HANDLE_KILLPRIV_V2
+
+Fixes:
+* Fixed compilation failure on FreeBSD (mount_bsd.c now points to correct
+  header)
+
+libfuse 3.16.2 (2023-10-10)
+===========================
+
+* Various small fixes and improvements.
+
+libfuse 3.16.1 (2023-08-08)
+===========================
+
+* Readdir kernel cache can be enabled from high-level API.
+
+libfuse 3.15.1 (2023-07-05)
+===========================
+
+Future libfuse releases will be signed with `signify`_ rather than PGP (rationale_). This
+release is the last to be signed with PGP and contains the signify public key for current
+(3.15.X) and upcoming  (3.16.X) minor release cycle.
+
+.. _signify:  https://www.openbsd.org/papers/bsdcan-signify.html
+.. _rationale: https://latacora.micro.blog/2019/07/16/the-pgp-problem.html
+
+
+libfuse 3.15.0 (2023-06-09)
+===========================
+
+* Improved support for some less common systems (32 bit, alternative libcs)
+
+* Unsupported mount options are no longer silently accepted.
+
+* auto_unmount is now compatible with allow_other.
+
+
+libfuse 3.14.1 (2023-03-26)
+===========================
+
+* The extended attribute name passed to the setxattr() handler is no longer
+  truncated at the beginning (bug introduced in 3.13.0).
+  
+* As a result of the above, the additional setattr() flags introduced in 3.14 are no
+  longer available for now. They will hopefully be reintroduced in the next release.
+
+* Further improvements of configuration header handling.
+
+
 libfuse 3.14.0 (2023-02-17)
 ===========================
 
@@ -45,7 +263,7 @@ The following changes apply when using the most recent API (-DFUSE_USE_VERSION=3
 see `example/passthrough_hp.cc` for an example for how to usse the new API):
 
 * `struct fuse_loop_config` is now private and has to be constructed using
-  *fuse_loop_cfg_create()* and detroyed with *fuse_loop_cfg_destroy()*.  Parameters can be
+  *fuse_loop_cfg_create()* and destroyed with *fuse_loop_cfg_destroy()*.  Parameters can be
   changed using `fuse_loop_cfg_set_*()` functions.
 
 * *fuse_session_loop_mt()* now accepts `struct fuse_loop_config *` as NULL pointer.

@@ -1,0 +1,1595 @@
+/*
+ * FUSE: Filesystem in Userspace
+ * Copyright (C) 2025  Bernd Schubert <bschubert@ddn.com>
+ *
+ * Implementation of (most of) FUSE-over-io-uring.
+ *
+ * This program can be distributed under the terms of the GNU LGPLv2.
+ * See the file LGPL2.txt
+ */
+
+#define _GNU_SOURCE
+
+#include "fuse_i.h"
+#include "fuse_kernel.h"
+#include "fuse_uring_i.h"
+#include "fuse_tsan_i.h"
+
+#include <stdlib.h>
+#include <liburing.h>
+#include <sys/sysinfo.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/mempolicy.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <linux/sched.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <time.h>
+
+/* Size of command data area in SQE when IORING_SETUP_SQE128 is used */
+#define FUSE_URING_MAX_SQE128_CMD_DATA 80
+
+#define FUSE_URING_DRAIN_POLL_US	10000
+#define FUSE_URING_SUBMIT_MAX_RETRIES	100
+
+/*
+ * A queue's bufpool is the only buffer the queue registers with io_uring, so
+ * it always lands at index 0 of the ring's registered buffer table.
+ */
+#define FUSE_URING_BUFPOOL_BUF_INDEX 0
+
+struct fuse_ring_ent {
+	struct fuse_ring_queue *ring_queue; /* back pointer */
+	struct fuse_req req;
+
+	struct fuse_uring_req_header *req_header;
+	void *op_payload;
+	size_t req_payload_sz;
+
+	/* commit id of a fuse request */
+	uint64_t req_commit_id;
+
+	enum fuse_uring_cmd last_cmd;
+
+	/* header and payload */
+	struct iovec iov[2];
+};
+
+struct fuse_ring_queue {
+	/* back pointer */
+	struct fuse_ring_pool *ring_pool;
+	int qid;
+	pthread_t tid;
+	int eventfd;
+	size_t req_header_sz;
+	struct io_uring ring;
+
+	/*
+	 * All payload buffers of this queue are in one contiguous mapping.
+	 *
+	 * In bufpool mode the kernel owns the assignment of buffers to entries
+	 * and tells us per request which one it picked. Otherwise each entry
+	 * keeps one buffer of the mapping for the lifetime of the ring.
+	 */
+	void *payload_mem;
+	size_t payload_mem_sz;
+
+	/*
+	 * Index of payload_mem in this ring's registered buffer table, or -1
+	 * where it is not registered (eg every queue not on a bufpool, or a
+	 * pooled one whose registration RLIMIT_MEMLOCK refused.
+	 */
+	int bufpool_buf_index;
+
+	/*
+	 * Let the kernel manage the payload memory regions for the queues
+	 * instead of allocating + binding a buffer to every entry for the
+	 * lifetime of the ring. Only allowed if the kernel has advertised
+	 * FUSE_HAS_IO_URING_BUFPOOL.
+	 */
+	bool use_bufpool;
+
+	pthread_mutex_t ring_lock;
+
+	/* batched inline replies across cqe handling; flushed by the loop */
+	_Atomic bool cqe_processing;
+
+	/* the ring thread submits for every replier until its queue is empty */
+	_Atomic bool draining;
+
+	/* one for the pool, one per entry handed to the application */
+	_Atomic int ref_cnt;
+
+	/* size depends on queue depth */
+	struct fuse_ring_ent ent[];
+};
+
+/**
+ * Main fuse_ring structure, holds all fuse-ring data
+ */
+struct fuse_ring_pool {
+	struct fuse_session *se;
+
+	/*
+	 * Held by se->uring.pool and by every queue; a queue teardown could
+	 * not clean up keeps the pool, and through it the session, alive.
+	 */
+	_Atomic int ref_cnt;
+
+	/*
+	 * Ring teardown in progress. Not se->mt_exited: a failed
+	 * fuse_uring_start() falls back to /dev/fuse and keeps serving.
+	 */
+	_Atomic bool stopping;
+
+	/* mirror of se->conn.io_uring_single_issuer, fixed at ring creation */
+	bool single_issuer;
+
+	/* number of queues */
+	size_t nr_queues;
+
+	/* number of per queue entries */
+	size_t queue_depth;
+
+	/* max payload size for fuse requests*/
+	size_t max_req_payload_sz;
+
+	/*
+	 * Size of one payload buffer within a queue's payload_mem. At least
+	 * max_req_payload_sz.
+	 */
+	size_t payload_chunk_sz;
+
+	/* size of a single queue */
+	size_t queue_mem_size;
+
+	unsigned int started_threads;
+	unsigned int failed_threads;
+
+	/* Avoid sending queue entries before FUSE_INIT reply*/
+	sem_t init_sem;
+
+	pthread_cond_t thread_start_cond;
+	pthread_mutex_t thread_start_mutex;
+
+	/* pointer to the first queue */
+	struct fuse_ring_queue *queues;
+};
+
+static size_t
+fuse_ring_queue_size(const size_t q_depth)
+{
+	const size_t req_size = sizeof(struct fuse_ring_ent) * q_depth;
+
+	return sizeof(struct fuse_ring_queue) + req_size;
+}
+
+static struct fuse_ring_queue *
+fuse_uring_get_queue(struct fuse_ring_pool *fuse_ring, int qid)
+{
+	void *ptr =
+		((char *)fuse_ring->queues) + (qid * fuse_ring->queue_mem_size);
+
+	return ptr;
+}
+
+/**
+ * return a pointer to the 80B area
+ */
+static void *fuse_uring_get_sqe_cmd(struct io_uring_sqe *sqe)
+{
+	return (void *)&sqe->cmd[0];
+}
+
+static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *req,
+					const unsigned int qid,
+					const uint64_t commit_id)
+{
+	/*
+	 * SQEs are recycled and liburing does not clear the 80B command area,
+	 * so what a previous command left in the reserved fields and in the
+	 * union would be read back as this command's. The kernel rejects a
+	 * REGISTER whose ent_zero_copy_buf_index is set on a queue that is not
+	 * a zero-copy one, and an ADD_BUFPOOL with a non-zero reserved field.
+	 */
+	memset(req, 0, sizeof(*req));
+
+	req->qid = qid;
+	req->commit_id = commit_id;
+}
+
+static void
+fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
+		       __u32 cmd_op)
+{
+	/* These fields should be written once, never change */
+	sqe->opcode = IORING_OP_URING_CMD;
+
+	/*
+	 * IOSQE_FIXED_FILE: fd is the index to the fd *array*
+	 * given to io_uring_register_files()
+	 */
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->fd = 0;
+
+	sqe->uring_cmd_flags = 0;
+	sqe->buf_index = 0;
+	sqe->ioprio = 0;
+	sqe->off = 0;
+
+	io_uring_sqe_set_data(sqe, req);
+
+	sqe->cmd_op = cmd_op;
+	sqe->__pad1 = 0;
+}
+
+/*
+ * Point the SQE at the queue's registered bufpool. The kernel refuses any
+ * command that imports a payload from a registered bufpool without it, so this
+ * has to be applied to every REGISTER, COMMIT_AND_FETCH and ADD_BUFPOOL SQE of
+ * such a queue. A no-op if the pool is not registered.
+ */
+static void fuse_uring_sqe_set_bufpool(struct io_uring_sqe *sqe,
+				       const struct fuse_ring_queue *queue)
+{
+	if (queue->bufpool_buf_index < 0)
+		return;
+
+	sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
+	sqe->buf_index = queue->bufpool_buf_index;
+}
+
+static int fuse_uring_submit(struct fuse_ring_queue *queue, unsigned int wait_nr)
+{
+	unsigned int retries = 0;
+
+	do {
+		struct fuse_session *se = queue->ring_pool->se;
+		int res = io_uring_submit_and_wait(&queue->ring, wait_nr);
+		if (res == -EINTR)
+			continue;
+		if (res == -EAGAIN && retries++ < FUSE_URING_SUBMIT_MAX_RETRIES) {
+			usleep(FUSE_URING_DRAIN_POLL_US);
+			continue;
+		}
+		if (res < 0) {
+			se->error = res;
+			fuse_log(FUSE_LOG_ERR, "qid=%d failed to submit: %s\n",
+				 queue->qid, strerror(-res));
+			fuse_session_exit(se);
+			return res;
+		}
+	} while (io_uring_sq_ready(&queue->ring));
+
+	return 0;
+}
+
+static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
+				 struct fuse_ring_queue *queue,
+				 struct fuse_ring_ent *ring_ent)
+{
+	const bool draining = atomic_load(&queue->draining);
+	const bool locked = !ring_pool->single_issuer || draining;
+	struct fuse_session *se = ring_pool->se;
+	struct fuse_uring_req_header *rrh = ring_ent->req_header;
+	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
+	struct fuse_uring_ent_in_out *ent_in_out =
+		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+	struct io_uring_sqe *sqe;
+	int res = 0;
+
+	tsan_release_reply(se);
+
+	/*
+	 * Multi-issuer: serialise every submission-side SQ access under
+	 * ring_lock. Single-issuer: only the uring thread submits, so skip the
+	 * lock and batch inline replies (cqe_processing), flushed by the next
+	 * submit_and_wait().
+	 */
+	if (locked)
+		pthread_mutex_lock(&queue->ring_lock);
+
+	sqe = io_uring_get_sqe(&queue->ring);
+
+	if (sqe == NULL) {
+		/* This is an impossible condition, unless there is a bug.
+		 * The kernel sent back an SQEs, which is assigned to a request.
+		 * There is no way to get out of SQEs, as the number of
+		 * SQEs matches the number tof requests.
+		 */
+
+		if (locked)
+			pthread_mutex_unlock(&queue->ring_lock);
+		se->error = -EIO;
+		fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
+
+		return -EIO;
+	}
+
+	ring_ent->last_cmd = FUSE_IO_URING_CMD_COMMIT_AND_FETCH;
+	fuse_uring_sqe_prepare(sqe, ring_ent, ring_ent->last_cmd);
+	fuse_uring_sqe_set_bufpool(sqe, queue);
+	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid,
+				    ring_ent->req_commit_id);
+
+	if (se->debug) {
+		fuse_log(FUSE_LOG_DEBUG, "    unique: %" PRIu64 ", result=%d\n",
+			 out->unique, ent_in_out->payload_sz);
+	}
+
+	/* while draining only the ring thread submits, for everyone */
+	if (!draining &&
+	    !atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
+		res = fuse_uring_submit(queue, 0);
+
+	if (locked)
+		pthread_mutex_unlock(&queue->ring_lock);
+
+	return res < 0 ? res : 0;
+}
+
+int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
+			 void **mr)
+{
+	struct fuse_ring_ent *ring_ent;
+
+	/* Not possible without io-uring interface */
+	if (!req->flags.is_uring)
+		return -EINVAL;
+
+	ring_ent = container_of(req, struct fuse_ring_ent, req);
+
+	*payload = ring_ent->op_payload;
+	*payload_sz = ring_ent->req_payload_sz;
+
+	/*
+	 * For now unused, but will be used later when the application can
+	 * allocate the buffers itself and register them for rdma.
+	 */
+	if (mr)
+		*mr = NULL;
+
+	return 0;
+}
+
+int send_reply_uring(fuse_req_t req, int error, const void *arg, size_t argsize)
+{
+	int res;
+	struct fuse_ring_ent *ring_ent =
+		container_of(req, struct fuse_ring_ent, req);
+	struct fuse_uring_req_header *rrh = ring_ent->req_header;
+	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
+	struct fuse_uring_ent_in_out *ent_in_out =
+		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+
+	struct fuse_ring_queue *queue = ring_ent->ring_queue;
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	size_t max_payload_sz = ring_pool->max_req_payload_sz;
+
+	if (argsize > max_payload_sz) {
+		fuse_log(FUSE_LOG_ERR, "argsize %zu exceeds buffer size %zu",
+			 argsize, max_payload_sz);
+		error = -EINVAL;
+	} else if (argsize) {
+		if (arg != ring_ent->op_payload)
+			memcpy(ring_ent->op_payload, arg, argsize);
+	}
+	ent_in_out->payload_sz = argsize;
+
+	out->error  = error;
+	out->unique = req->unique;
+
+	res = fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
+
+	fuse_free_req(req);
+
+	return res;
+}
+
+int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
+		    enum fuse_buf_copy_flags flags)
+{
+	struct fuse_ring_ent *ring_ent =
+		container_of(req, struct fuse_ring_ent, req);
+
+	struct fuse_ring_queue *queue = ring_ent->ring_queue;
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct fuse_uring_req_header *rrh = ring_ent->req_header;
+	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
+	struct fuse_uring_ent_in_out *ent_in_out =
+		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+	size_t max_payload_sz = ring_ent->req_payload_sz;
+	struct fuse_bufvec dest_vec = FUSE_BUFVEC_INIT(max_payload_sz);
+	int res;
+
+	dest_vec.buf[0].mem = ring_ent->op_payload;
+	dest_vec.buf[0].size = max_payload_sz;
+
+	res = fuse_buf_copy(&dest_vec, bufv, flags);
+
+	out->error  = res < 0 ? res : 0;
+	out->unique = req->unique;
+
+	ent_in_out->payload_sz = res > 0 ? res : 0;
+
+	res = fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
+
+	fuse_free_req(req);
+
+	return res;
+}
+
+/**
+ * Copy the iov into the ring buffer and submit and commit/fetch sqe
+ */
+int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
+{
+	struct fuse_ring_ent *ring_ent =
+		container_of(req, struct fuse_ring_ent, req);
+
+	struct fuse_ring_queue *queue = ring_ent->ring_queue;
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct fuse_uring_req_header *rrh = ring_ent->req_header;
+	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
+	struct fuse_uring_ent_in_out *ent_in_out =
+		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+	size_t max_buf = ring_pool->max_req_payload_sz;
+	size_t len = 0;
+	int res = 0;
+
+	/* copy iov into the payload, idx=0 is the header section */
+	for (int idx = 1; idx < count; idx++) {
+		const struct iovec *cur = &iov[idx];
+
+		if (len + cur->iov_len > max_buf) {
+			fuse_log(FUSE_LOG_ERR,
+				 "iov[%d] exceeds buffer size %zu",
+				 idx, max_buf);
+			res = -EINVAL; /* Gracefully handle this? */
+			break;
+		}
+
+		memcpy((char *)ring_ent->op_payload + len, cur->iov_base, cur->iov_len);
+		len += cur->iov_len;
+	}
+
+	ent_in_out->payload_sz = len;
+
+	out->error  = res;
+	out->unique = req->unique;
+	out->len = len;
+
+	return fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
+}
+
+static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
+				     size_t depth, int fd, int evfd,
+				     bool single_issuer)
+{
+	int rc;
+	struct io_uring_params params = {0};
+	int files[2] = { fd, evfd };
+
+	depth += 1; /* for the eventfd poll SQE */
+
+	params.flags = IORING_SETUP_SQE128;
+
+	/* Replies are batched and flushed in one io_uring_enter; don't let a
+	 * single failing commit SQE stall submission of the rest of the batch.
+	 */
+	params.flags |= IORING_SETUP_SUBMIT_ALL;
+
+	/* Avoid cq overflow */
+	params.flags |= IORING_SETUP_CQSIZE;
+	params.cq_entries = depth * 2;
+
+	/* These flags should help to increase performance, but actually
+	 * make it a bit slower - reason should get investigated.
+	 */
+	if (0) {
+		/* Has the main slow down effect */
+		params.flags |= IORING_SETUP_SINGLE_ISSUER;
+
+		// params.flags |= IORING_SETUP_DEFER_TASKRUN;
+		params.flags |= IORING_SETUP_TASKRUN_FLAG;
+
+		/* Second main effect to make it slower */
+		params.flags |= IORING_SETUP_COOP_TASKRUN;
+	}
+
+	rc = io_uring_queue_init_params(depth, ring, &params);
+	if (rc != 0) {
+		fuse_log(FUSE_LOG_ERR, "Failed to setup qid %zu: %d (%s)\n",
+			 qid, rc, strerror(-rc));
+		return rc;
+	}
+
+	rc = io_uring_register_files(ring, files, 1);
+	if (rc != 0) {
+		rc = -errno;
+		fuse_log(FUSE_LOG_ERR,
+			 "Failed to register files for ring idx %zu: %s",
+			 qid, strerror(errno));
+		return rc;
+	}
+
+	if (single_issuer) {
+		/*
+		 * Only fuse_uring_thread() issues io_uring_enter() on this
+		 * ring, so the registered ring-fd index is valid. Non-fatal -
+		 * older kernels just keep using the normal ring fd.
+		 */
+		rc = io_uring_register_ring_fd(ring);
+		if (rc < 0)
+			fuse_log(FUSE_LOG_DEBUG,
+				 "qid=%zu register_ring_fd failed: %s\n",
+				 qid, strerror(-rc));
+	}
+
+	return 0;
+}
+
+/* Number of entries the application still holds (ref_cnt > 1). */
+static size_t fuse_uring_queue_held(struct fuse_ring_queue *queue)
+{
+	return atomic_load(&queue->ref_cnt) - 1;
+}
+
+static void fuse_uring_pool_get(struct fuse_ring_pool *fuse_ring)
+{
+	fuse_ring->ref_cnt++;
+}
+
+static void fuse_uring_pool_put(struct fuse_ring_pool *fuse_ring)
+{
+	struct fuse_session *se = fuse_ring->se;
+
+	if (--fuse_ring->ref_cnt != 0)
+		return;
+
+	/*
+	 * se->uring.pool still points here, so freeing would be worse than
+	 * leaking. Leak and name the bug instead.
+	 */
+	if (!atomic_load(&fuse_ring->stopping)) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ring pool released before teardown\n");
+		PANIC_IF_PEDANTIC();
+		return;
+	}
+
+	free(fuse_ring->queues);
+	pthread_cond_destroy(&fuse_ring->thread_start_cond);
+	pthread_mutex_destroy(&fuse_ring->thread_start_mutex);
+	free(fuse_ring);
+
+	/*
+	 * Can be the last session reference: the session goes away here
+	 * when the application replies after fuse_session_destroy().
+	 */
+	fuse_session_put(se);
+}
+
+static void fuse_uring_queue_destroy(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *fuse_ring = queue->ring_pool;
+
+	if (queue->eventfd >= 0) {
+		close(queue->eventfd);
+		queue->eventfd = -1;
+	}
+
+	if (queue->ring.ring_fd != -1)
+		io_uring_queue_exit(&queue->ring);
+
+	for (size_t idx = 0; idx < fuse_ring->queue_depth; idx++) {
+		struct fuse_ring_ent *ent = &queue->ent[idx];
+
+		munmap(ent->req_header, queue->req_header_sz);
+	}
+
+	/* op_payload of every entry points into this */
+	if (queue->payload_mem != NULL)
+		munmap(queue->payload_mem, queue->payload_mem_sz);
+
+	pthread_mutex_destroy(&queue->ring_lock);
+	fuse_uring_pool_put(fuse_ring);
+}
+
+static void fuse_uring_queue_get(struct fuse_ring_queue *queue)
+{
+	queue->ref_cnt++;
+}
+
+static void fuse_uring_queue_put(struct fuse_ring_queue *queue)
+{
+	if (--queue->ref_cnt != 0)
+		return;
+
+	/* the ring thread still walks this queue; leak and name the bug */
+	if (!atomic_load(&queue->ring_pool->stopping)) {
+		fuse_log(FUSE_LOG_ERR, "fuse: qid=%d released before teardown\n",
+			 queue->qid);
+		PANIC_IF_PEDANTIC();
+		return;
+	}
+
+	fuse_uring_queue_destroy(queue);
+}
+
+/**
+ * Drop the queue reference an entry holds while the application has it.
+ */
+void fuse_uring_req_done(fuse_req_t req)
+{
+	struct fuse_ring_ent *ring_ent =
+		container_of(req, struct fuse_ring_ent, req);
+
+	fuse_uring_queue_put(ring_ent->ring_queue);
+}
+
+static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
+{
+	/*
+	 * Phase 1: ask every ring thread to drain. The eventfd completes the
+	 * poll SQE armed in fuse_uring_register_queue(); init_sem releases a
+	 * thread that is still waiting to be let into the loop, which happens
+	 * when ring startup failed before FUSE_INIT was answered.
+	 */
+	atomic_store(&fuse_ring->stopping, true);
+
+	for (size_t qid = 0; qid < fuse_ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue =
+			fuse_uring_get_queue(fuse_ring, qid);
+		uint64_t value = 1ULL;
+		ssize_t res;
+
+		if (queue->tid == 0)
+			continue;
+
+		sem_post(&fuse_ring->init_sem);
+
+		do {
+			res = write(queue->eventfd, &value, sizeof(value));
+		} while (res < 0 && errno == EINTR);
+
+		if (res != (ssize_t)sizeof(value))
+			fuse_log(FUSE_LOG_ERR, "qid=%d eventfd wake failed: %s\n",
+				 queue->qid, strerror(errno));
+	}
+
+	/*
+	 * Phase 2: join, then drop the pool's queue reference. A thread only
+	 * returns once its queue has nothing outstanding, so there is no
+	 * deadline here; an application that never replies is what
+	 * fuse_session_start_teardown_watchdog() is for.
+	 */
+	for (size_t qid = 0; qid < fuse_ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue =
+			fuse_uring_get_queue(fuse_ring, qid);
+
+		if (queue->tid != 0) {
+			pthread_join(queue->tid, NULL);
+			queue->tid = 0;
+		}
+
+		fuse_uring_queue_put(queue);
+	}
+
+	/*
+	 * se->uring.pool's own reference, dropped last so the loop above can
+	 * never free the pool it is walking.
+	 */
+	fuse_uring_pool_put(fuse_ring);
+}
+
+/*
+ * Submit a queue setup command and wait for its completion.
+ *
+ * ADD_QUEUE and ADD_BUFPOOL are handled synchronously by the kernel. Unlike
+ * REGISTER they complete without waiting for fuse traffic. Nothing else has
+ * been submitted on this ring yet, so the next CQE is the one for the sqe.
+ */
+static int fuse_uring_submit_setup_sqe(struct fuse_ring_queue *queue)
+{
+	struct io_uring_cqe *cqe;
+	int res;
+
+	res = io_uring_submit(&queue->ring);
+	if (res < 0)
+		return res;
+
+	do {
+		res = io_uring_wait_cqe(&queue->ring, &cqe);
+	} while (res == -EINTR);
+	if (res < 0)
+		return res;
+
+	res = cqe->res;
+	io_uring_cqe_seen(&queue->ring, cqe);
+
+	return res;
+}
+
+/* Get an SQE for a queue setup command */
+static struct io_uring_sqe *
+fuse_uring_setup_sqe(struct fuse_ring_queue *queue, __u32 cmd_op,
+		     struct fuse_uring_cmd_req **cmd_req)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (!sqe) {
+		fuse_log(FUSE_LOG_ERR, "qid=%d failed to get a setup SQE\n",
+			 queue->qid);
+		return NULL;
+	}
+
+	fuse_uring_sqe_prepare(sqe, NULL, cmd_op);
+	sqe->addr = 0;
+	sqe->len = 0;
+
+	*cmd_req = fuse_uring_get_sqe_cmd(sqe);
+	fuse_uring_sqe_set_req_data(*cmd_req, queue->qid, 0);
+
+	return sqe;
+}
+
+/*
+ * Create the queue in the kernel up front.
+ *
+ * A queue is otherwise created implicitly by the first REGISTER, which also
+ * fixes it to per-entry payload buffers, which would be too late for
+ * bufpools.
+ */
+static int fuse_uring_add_queue(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_cmd_req *cmd_req;
+	const struct io_uring_sqe *sqe;
+
+	sqe = fuse_uring_setup_sqe(queue, FUSE_IO_URING_CMD_ADD_QUEUE, &cmd_req);
+	if (!sqe)
+		return -EIO;
+
+	return fuse_uring_submit_setup_sqe(queue);
+}
+
+static int fuse_uring_add_bufpool(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_cmd_req *cmd_req;
+	struct io_uring_sqe *sqe;
+
+	sqe = fuse_uring_setup_sqe(queue, FUSE_IO_URING_CMD_ADD_BUFPOOL,
+				   &cmd_req);
+	if (!sqe)
+		return -EIO;
+
+	cmd_req->bufpool.uaddr = (uint64_t)(uintptr_t)queue->payload_mem;
+	cmd_req->bufpool.len = queue->payload_mem_sz;
+
+	fuse_uring_sqe_set_bufpool(sqe, queue);
+
+	return fuse_uring_submit_setup_sqe(queue);
+}
+
+/*
+ * Register the bufpool as an io_uring fixed buffer (if possible), so that the
+ * kernel can skip pinning overhead per i/o. This is best effort. This may
+ * fail because of RLIMIT_MEMLOCK. If it fails, the pool still works without
+ * it, but i/o requests incur pinning overhead.
+ */
+static void fuse_uring_register_bufpool(struct fuse_ring_queue *queue)
+{
+	struct iovec iov = {
+		.iov_base = queue->payload_mem,
+		.iov_len = queue->payload_mem_sz,
+	};
+	int rc;
+
+	rc = io_uring_register_buffers(&queue->ring, &iov, 1);
+	if (rc < 0) {
+		fuse_log(FUSE_LOG_DEBUG,
+			 "qid=%d bufpool not registered as fixed buffer: %s\n",
+			 queue->qid, strerror(-rc));
+		return;
+	}
+
+	queue->bufpool_buf_index = FUSE_URING_BUFPOOL_BUF_INDEX;
+}
+
+/*
+ * Give every entry its own slice of the queue's mapping, which is what a queue
+ * not on a bufpool registers and owns for the lifetime of the ring.
+ */
+static void fuse_uring_bind_ent_payloads(struct fuse_ring_queue *queue)
+{
+	const struct fuse_ring_pool *ring = queue->ring_pool;
+
+	for (size_t idx = 0; idx < ring->queue_depth; idx++)
+		queue->ent[idx].op_payload = (char *)queue->payload_mem +
+					     idx * ring->payload_chunk_sz;
+}
+
+/*
+ * Give up on this queue's bufpool and leave it with a payload buffer per entry.
+ *
+ * The kernel has not committed the queue to either mode until a REGISTER
+ * arrives, so one that failed ADD_QUEUE or ADD_BUFPOOL can still take the
+ * per-entry path. The mapping is allocated either way and is at least as large
+ * per-entry needs, so nothing has to be reallocated.
+ */
+static void fuse_uring_disable_bufpool(struct fuse_ring_queue *queue)
+{
+	queue->use_bufpool = false;
+	/* stops the SQEs importing a payload that is no longer pooled */
+	queue->bufpool_buf_index = -1;
+	fuse_uring_bind_ent_payloads(queue);
+}
+
+static int fuse_uring_register_ent(struct fuse_ring_queue *queue,
+				   struct fuse_ring_ent *ent)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (sqe == NULL) {
+		/*
+		 * All SQEs are idle here - no good reason this
+		 * could fail
+		 */
+		fuse_log(FUSE_LOG_ERR, "Failed to get all ring SQEs");
+		return -EIO;
+	}
+
+	ent->last_cmd = FUSE_IO_URING_CMD_REGISTER;
+	fuse_uring_sqe_prepare(sqe, ent, ent->last_cmd);
+	fuse_uring_sqe_set_bufpool(sqe, queue);
+
+	/* only needed for fetch */
+	ent->iov[0].iov_base = ent->req_header;
+	ent->iov[0].iov_len = queue->req_header_sz;
+
+	if (queue->use_bufpool) {
+		/*
+		 * The entry does not own a payload buffer. The buffer gets
+		 * assigned by the kernel out of the buffer pool per request.
+		 */
+		ent->iov[1].iov_base = NULL;
+		ent->iov[1].iov_len = 0;
+	} else {
+		/*
+		 * The slot, not req_payload_sz: REGISTER rejects an iov below
+		 * the payload size the kernel derived, which rounds max_write
+		 * up to a page. The entry still only ever carries
+		 * req_payload_sz of it.
+		 */
+		ent->iov[1].iov_base = ent->op_payload;
+		ent->iov[1].iov_len = queue->ring_pool->payload_chunk_sz;
+	}
+
+	sqe->addr = (uint64_t)(ent->iov);
+	sqe->len = 2;
+
+	/* this is a fetch, kernel does not read commit id */
+	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid, 0);
+
+	return 0;
+
+}
+
+static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	unsigned int sq_ready;
+	struct io_uring_sqe *sqe;
+
+	for (size_t idx = 0; idx < ring_pool->queue_depth; idx++) {
+		struct fuse_ring_ent *ent = &queue->ent[idx];
+		int res;
+
+		res = fuse_uring_register_ent(queue, ent);
+		if (res != 0)
+			return res;
+	}
+
+	sq_ready = io_uring_sq_ready(&queue->ring);
+	if (sq_ready != ring_pool->queue_depth) {
+		fuse_log(FUSE_LOG_ERR,
+			 "SQE ready mismatch, expected %zu got %u\n",
+			 ring_pool->queue_depth, sq_ready);
+		return -EINVAL;
+	}
+
+	/* Poll SQE for the eventfd to wake up on teardown */
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (sqe == NULL) {
+		fuse_log(FUSE_LOG_ERR, "Failed to get eventfd SQE");
+		return -EIO;
+	}
+
+	io_uring_prep_poll_add(sqe, queue->eventfd, POLLIN);
+	io_uring_sqe_set_data(sqe, (void *)(uintptr_t)queue->eventfd);
+
+	/* Only preparation until here, no submission yet */
+
+	return 0;
+}
+
+static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
+{
+	struct fuse_ring_pool *fuse_ring = NULL;
+	const size_t nr_queues = get_nprocs_conf();
+	size_t payload_sz = se->bufsize - FUSE_BUFFER_HEADER_SIZE;
+	bool use_bufpool = se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL;
+	const size_t page_sz = sysconf(_SC_PAGESIZE);
+	size_t chunk_sz;
+	size_t queue_sz;
+
+	if (se->debug)
+		fuse_log(FUSE_LOG_DEBUG,
+			 "starting io-uring q-depth=%d bufpool=%d\n",
+			 se->uring.q_depth, use_bufpool);
+
+	if (!payload_sz) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: io-uring requires a non-zero max_write\n");
+		goto err;
+	}
+
+	/*
+	 * The kernel sizes a payload buffer itself, as
+	 *   max(FUSE_MIN_READ_BUFFER, max_write, max_pages * page_sz)
+	 * and both modes have to agree with it: a bufpool queue because the
+	 * kernel carves the pool into chunks of that size, a per-entry queue
+	 * because REGISTER refuses an iov shorter than it.
+	 */
+	chunk_sz = ROUND_UP(payload_sz, page_sz);
+	if (chunk_sz < FUSE_MIN_READ_BUFFER)
+		chunk_sz = FUSE_MIN_READ_BUFFER;
+
+	/* ADD_BUFPOOL passes the pool length in a u32 */
+	if (use_bufpool && se->uring.q_depth > UINT32_MAX / chunk_sz) {
+		fuse_log(FUSE_LOG_WARNING,
+			 "fuse: %u buffers of %zu bytes exceed the pool limit, using a payload buffer per entry\n",
+			 se->uring.q_depth, chunk_sz);
+		use_bufpool = false;
+		/* want_ext is the negotiation result from here on */
+		fuse_unset_feature_flag(&se->conn, FUSE_CAP_IO_URING_BUFPOOL);
+	}
+
+	fuse_ring = calloc(1, sizeof(*fuse_ring));
+	if (fuse_ring == NULL) {
+		fuse_log(FUSE_LOG_ERR, "Allocating the ring failed\n");
+		goto err;
+	}
+
+	/* Both are dropped by fuse_session_destruct_uring() on the err path. */
+	fuse_ring->se = se;
+	fuse_ring->ref_cnt = 1;
+	fuse_session_get(se);
+
+	queue_sz = fuse_ring_queue_size(se->uring.q_depth);
+	fuse_ring->queues = calloc(1, queue_sz * nr_queues);
+	if (fuse_ring->queues == NULL) {
+		fuse_log(FUSE_LOG_ERR, "Allocating the queues failed\n");
+		goto err;
+	}
+
+	fuse_ring->nr_queues = nr_queues;
+	fuse_ring->queue_depth = se->uring.q_depth;
+	fuse_ring->max_req_payload_sz = payload_sz;
+	fuse_ring->payload_chunk_sz = chunk_sz;
+	fuse_ring->queue_mem_size = queue_sz;
+	fuse_ring->single_issuer = se->conn.io_uring_single_issuer;
+
+	/*
+	 * very basic queue initialization, that cannot fail and will
+	 * allow easy cleanup if something (like mmap) fails in the middle
+	 * below
+	 */
+	for (size_t qid = 0; qid < nr_queues; qid++) {
+		struct fuse_ring_queue *queue =
+			fuse_uring_get_queue(fuse_ring, qid);
+
+		queue->ring.ring_fd = -1;
+		queue->qid = qid;
+		queue->ring_pool = fuse_ring;
+		queue->eventfd = -1;
+		queue->bufpool_buf_index = -1;
+		queue->use_bufpool = use_bufpool;
+		pthread_mutex_init(&queue->ring_lock, NULL);
+		queue->ref_cnt = 1;
+		fuse_uring_pool_get(fuse_ring);
+	}
+
+	pthread_cond_init(&fuse_ring->thread_start_cond, NULL);
+	pthread_mutex_init(&fuse_ring->thread_start_mutex, NULL);
+	sem_init(&fuse_ring->init_sem, 0, 0);
+
+	return fuse_ring;
+
+err:
+	if (fuse_ring)
+		fuse_session_destruct_uring(fuse_ring);
+
+	return NULL;
+}
+
+static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
+				struct fuse_ring_ent *ent)
+{
+	const bool draining = atomic_load(&queue->draining);
+	const bool locked = !queue->ring_pool->single_issuer || draining;
+	struct io_uring_sqe *sqe;
+
+	if (locked)
+		pthread_mutex_lock(&queue->ring_lock);
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (sqe == NULL) {
+		/* This is an impossible condition, unless there is a bug.
+		 * The kernel sent back an SQEs, which is assigned to a request.
+		 * There is no way to get out of SQEs, as the number of
+		 * SQEs matches the number tof requests.
+		 */
+
+		if (locked)
+			pthread_mutex_unlock(&queue->ring_lock);
+		queue->ring_pool->se->error = -EIO;
+		fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
+
+		return;
+	}
+
+	fuse_uring_sqe_prepare(sqe, ent, ent->last_cmd);
+	fuse_uring_sqe_set_bufpool(sqe, queue);
+
+	switch (ent->last_cmd) {
+	case FUSE_IO_URING_CMD_REGISTER:
+		sqe->addr = (uint64_t)(ent->iov);
+		sqe->len = 2;
+		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
+					    queue->qid, 0);
+		break;
+	case FUSE_IO_URING_CMD_COMMIT_AND_FETCH:
+		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
+					    queue->qid, ent->req_commit_id);
+		break;
+	default:
+		fuse_log(FUSE_LOG_ERR, "Unknown command type: %d\n",
+			 ent->last_cmd);
+		queue->ring_pool->se->error = -EINVAL;
+		break;
+	}
+
+	if (!draining &&
+	    !atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
+		fuse_uring_submit(queue, 0);
+	if (locked)
+		pthread_mutex_unlock(&queue->ring_lock);
+}
+
+static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
+				  struct io_uring_cqe *cqe)
+{
+	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+
+	if (!ent) {
+		fuse_log(FUSE_LOG_ERR,
+			 "cqe=%p io_uring_cqe_get_data returned NULL\n", cqe);
+		return;
+	}
+
+	struct fuse_req *req = &ent->req;
+	struct fuse_ring_pool *fuse_ring = queue->ring_pool;
+	struct fuse_uring_req_header *rrh = ent->req_header;
+
+	struct fuse_in_header *in = (struct fuse_in_header *)&rrh->in_out;
+	const struct fuse_uring_ent_in_out *ent_in_out = &rrh->ring_ent_in_out;
+
+	ent->req_commit_id = ent_in_out->commit_id;
+	if (unlikely(ent->req_commit_id == 0)) {
+		/*
+		 * If this happens kernel will not find the response - it will
+		 * be stuck forever - better to abort immediately.
+		 */
+		fuse_log(FUSE_LOG_ERR, "Received invalid commit_id=0\n");
+		abort();
+	}
+
+	if (queue->use_bufpool) {
+		/*
+		 * The buffer the kernel picked for this request out of the
+		 * bufpool.
+		 */
+		if (unlikely(ent_in_out->offset >
+			     queue->payload_mem_sz - ent->req_payload_sz)) {
+			fuse_log(FUSE_LOG_ERR,
+				 "Received out of range bufpool offset %u\n",
+				 ent_in_out->offset);
+			abort();
+		}
+
+		ent->op_payload = (char *)queue->payload_mem + ent_in_out->offset;
+	}
+
+	memset(&req->flags, 0, sizeof(req->flags));
+	memset(&req->u, 0, sizeof(req->u));
+	req->flags.is_uring = 1;
+	req->ref_cnt++;
+	req->ch = NULL; /* not needed for uring */
+	req->interrupted = 0;
+	list_init_req(req);
+
+	/* dropped by fuse_free_req() when the application replies */
+	fuse_uring_queue_get(queue);
+
+	fuse_session_process_uring_cqe(fuse_ring->se, req, in, &rrh->op_in,
+				       ent->op_payload, ent_in_out->payload_sz);
+}
+
+static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct fuse_session *se = ring_pool->se;
+	size_t num_completed = 0;
+	struct io_uring_cqe *cqe;
+	unsigned int head;
+	struct fuse_ring_ent *ent;
+	int ret = 0;
+
+	io_uring_for_each_cqe(&queue->ring, head, cqe) {
+		int err = 0;
+
+		num_completed++;
+
+		err = cqe->res;
+		if (unlikely(err != 0)) {
+			if (err > 0 && ((uintptr_t)io_uring_cqe_get_data(cqe) ==
+					(unsigned int)queue->eventfd)) {
+				/* teardown wake; stopping ends the thread loop */
+				break;
+			}
+
+
+			switch (err) {
+			case -EAGAIN:
+				fallthrough;
+			case -EINTR:
+				ent = io_uring_cqe_get_data(cqe);
+				/*
+				 * A queue setup command carries no entry, so
+				 * there is nothing to resubmit. Reaching here
+				 * means its submitter already gave up on it
+				 * and moved the queue on without it.
+				 */
+				if (!ent)
+					continue;
+				fuse_uring_resubmit(queue, ent);
+				continue;
+			default:
+				break;
+			}
+
+			/* -ENOTCONN is ok on umount  */
+			if (err != -ENOTCONN)
+				se->error = cqe->res;
+
+			/*
+			 * Stop processing CQEs when kernel signaled us an error,
+			 * overall system state is unclear then.
+			 */
+			ret = err;
+			break;
+		} else {
+			fuse_uring_handle_cqe(queue, cqe);
+		}
+	}
+
+	if (num_completed)
+		io_uring_cq_advance(&queue->ring, num_completed);
+
+	return ret;
+}
+
+/*
+ * Submit what repliers queued and report how many entries the application
+ * still owes a reply for. Completions are advanced but not dispatched: a
+ * commit re-arms a fetch, and a request taken now would never be answered.
+ *
+ * @return number of entries the application still holds
+ */
+static size_t fuse_uring_drain(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct fuse_session_uring *uring = &ring_pool->se->uring;
+	struct io_uring_cqe *cqe;
+	unsigned int head;
+	size_t num_completed = 0;
+	size_t held;
+
+	/* repliers only queue now; read the count before flushing them */
+	atomic_store(&queue->draining, true);
+	held = fuse_uring_queue_held(queue);
+
+	pthread_mutex_lock(&queue->ring_lock);
+	fuse_uring_submit(queue, 0);
+	pthread_mutex_unlock(&queue->ring_lock);
+
+	io_uring_for_each_cqe(&queue->ring, head, cqe)
+		num_completed++;
+	if (num_completed)
+		io_uring_cq_advance(&queue->ring, num_completed);
+
+	if (held) {
+		fuse_teardown_waiting_fn waiting;
+
+		waiting = atomic_exchange(&uring->fsu_test_teardown_waiting, NULL);
+		if (waiting)
+			waiting();
+		usleep(FUSE_URING_DRAIN_POLL_US);
+	}
+
+	return held;
+}
+
+/**
+ * In per-core-queue configuration we have thread per core - the thread
+ * to that core
+ */
+static void fuse_uring_set_thread_core(int qid)
+{
+	cpu_set_t mask;
+	int rc;
+
+	CPU_ZERO(&mask);
+	CPU_SET(qid, &mask);
+	rc = sched_setaffinity(0, sizeof(cpu_set_t), &mask);
+	if (rc != 0)
+		fuse_log(FUSE_LOG_ERR, "Failed to bind qid=%d to its core: %s\n",
+			 qid, strerror(errno));
+
+	if (0) {
+		const int policy = SCHED_IDLE;
+		const struct sched_param param = {
+			.sched_priority = sched_get_priority_min(policy),
+		};
+
+		/* Set the lowest possible priority, so that the application
+		 * submitting requests is not moved away from the current core.
+		 */
+		rc = sched_setscheduler(0, policy, &param);
+		if (rc != 0)
+			fuse_log(FUSE_LOG_ERR, "Failed to set scheduler: %s\n",
+				strerror(errno));
+	}
+}
+
+static void *alloc_local(size_t size)
+{
+	void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return NULL;
+	syscall(SYS_mbind, p, size, MPOL_LOCAL, NULL, 0, 0);
+	if (madvise(p, size, MADV_POPULATE_WRITE) < 0)
+		return NULL;
+	return p;
+}
+
+/*
+ * @return negative error code or io-uring file descriptor
+ */
+static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *ring = queue->ring_pool;
+	struct fuse_session *se = ring->se;
+	int res;
+	size_t page_sz = sysconf(_SC_PAGESIZE);
+
+	queue->eventfd = eventfd(0, EFD_CLOEXEC);
+	if (queue->eventfd < 0) {
+		res = -errno;
+		fuse_log(FUSE_LOG_ERR,
+			 "Failed to create eventfd for qid %d: %s\n",
+			 queue->qid, strerror(errno));
+		return res;
+	}
+
+	res = fuse_queue_setup_io_uring(&queue->ring, queue->qid,
+					ring->queue_depth, se->fd,
+					queue->eventfd, ring->single_issuer);
+	if (res != 0) {
+		fuse_log(FUSE_LOG_ERR, "qid=%d io_uring init failed\n",
+			 queue->qid);
+		return res;
+	}
+
+	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_uring_req_header),
+				       page_sz);
+
+	queue->payload_mem_sz = ring->queue_depth * ring->payload_chunk_sz;
+	queue->payload_mem = alloc_local(queue->payload_mem_sz);
+	if (!queue->payload_mem)
+		return -ENOMEM;
+
+	if (queue->use_bufpool)
+		fuse_uring_register_bufpool(queue);
+
+	for (size_t idx = 0; idx < ring->queue_depth; idx++) {
+		struct fuse_ring_ent *ring_ent = &queue->ent[idx];
+		struct fuse_req *req = &ring_ent->req;
+
+		ring_ent->ring_queue = queue;
+
+		/*
+		 * Also allocate the header to have it page aligned, which
+		 * is a requirement for page pinning
+		 */
+		ring_ent->req_header = alloc_local(queue->req_header_sz);
+		if (!ring_ent->req_header)
+			return -ENOMEM;
+
+		ring_ent->req_payload_sz = ring->max_req_payload_sz;
+
+		req->se = se;
+		pthread_mutex_init(&req->lock, NULL);
+		req->flags.is_uring = 1;
+		req->ref_cnt = 1; /* extra ref to avoid destruction */
+		list_init_req(req);
+	}
+
+	if (!queue->use_bufpool)
+		fuse_uring_bind_ent_payloads(queue);
+
+	return queue->ring.ring_fd;
+}
+
+/*
+ * Bring the queue up in the kernel and prepare its entries.
+ *
+ * Has to run after the FUSE_INIT reply, the kernel rejects any of these
+ * commands with -EAGAIN while the connection is not initialized yet.
+ */
+static int fuse_uring_start_queue(struct fuse_ring_queue *queue)
+{
+	int res;
+
+	if (queue->use_bufpool) {
+		res = fuse_uring_add_queue(queue);
+		if (!res)
+			res = fuse_uring_add_bufpool(queue);
+		if (res) {
+			fuse_log(FUSE_LOG_WARNING,
+				 "qid=%d bufpool setup failed (%s), falling back to a payload buffer per entry\n",
+				 queue->qid, strerror(-res));
+			EMIT_INIT_STATUS_LINE("io_uring_bufpool=off:qid=%d:%s",
+					      queue->qid, strerror(-res));
+			fuse_uring_disable_bufpool(queue);
+		}
+	}
+
+	res = fuse_uring_register_queue(queue);
+	if (res)
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse-uring error on preparing SQEs, aborting: %s\n",
+			 strerror(-res));
+
+	return res;
+}
+
+static void *fuse_uring_thread(void *arg)
+{
+	struct fuse_ring_queue *queue = arg;
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct fuse_session *se = ring_pool->se;
+	const bool single_issuer = ring_pool->single_issuer;
+	int err;
+	char thread_name[16] = { 0 };
+
+	snprintf(thread_name, 16, "fuse-ring-%d", queue->qid);
+	thread_name[15] = '\0';
+	fuse_set_thread_name(thread_name);
+
+	fuse_uring_set_thread_core(queue->qid);
+
+	err = fuse_uring_init_queue(queue);
+	pthread_mutex_lock(&ring_pool->thread_start_mutex);
+	if (err < 0)
+		ring_pool->failed_threads++;
+	ring_pool->started_threads++;
+	pthread_cond_broadcast(&ring_pool->thread_start_cond);
+	pthread_mutex_unlock(&ring_pool->thread_start_mutex);
+
+	if (err < 0) {
+		fuse_log(FUSE_LOG_ERR, "qid=%d queue setup failed\n",
+			 queue->qid);
+		goto out;
+	}
+
+	while (sem_wait(&ring_pool->init_sem) == -1 && errno == EINTR)
+		;
+
+	/* teardown posted init_sem rather than FUSE_INIT letting us in */
+	if (atomic_load_explicit(&ring_pool->stopping, memory_order_relaxed))
+		goto out;
+
+	/*
+	 * The connection is initialized now, so the kernel accepts the queue
+	 * setup commands. This is also what prepares the registration SQEs.
+	 */
+	err = fuse_uring_start_queue(queue);
+	if (err) {
+		fuse_log(FUSE_LOG_ERR, "qid=%d queue start failed\n",
+			 queue->qid);
+		se->error = err;
+		fuse_session_exit(se);
+		goto out;
+	}
+
+	/*
+	 * Multi-issuer flushes the registration SQEs here - safe without
+	 * ring_lock, no request can reach this queue yet. Single-issuer's
+	 * first submit_and_wait() below flushes them instead.
+	 */
+	if (!single_issuer)
+		fuse_uring_submit(queue, 0);
+
+	/* Not using fuse_session_exited(se), as that cannot be inlined */
+	while (true) {
+		const bool stopped =
+			atomic_load_explicit(&se->mt_exited,
+					     memory_order_relaxed) ||
+			atomic_load_explicit(&ring_pool->stopping,
+					     memory_order_relaxed);
+
+		if (stopped) {
+			if (fuse_uring_drain(queue) == 0)
+				break;
+			continue;
+		}
+
+		/*
+		 * Single-issuer: one combined submit_and_wait() flushes the
+		 * previous iteration's batched replies and waits. Multi-issuer:
+		 * split it - wait only here (no ring_lock) so off-thread
+		 * repliers keep submitting; the batched inline replies are
+		 * flushed below. The returned cqe is ignored; handle_cqes()
+		 * re-scans and advances the CQ.
+		 */
+		if (single_issuer) {
+			fuse_uring_submit(queue, 1);
+		} else {
+			struct io_uring_cqe *cqe;
+
+			io_uring_wait_cqe(&queue->ring, &cqe);
+		}
+
+		/* the thread submits for every replier while it handles cqes */
+		atomic_store_explicit(&queue->cqe_processing, true,
+				      memory_order_relaxed);
+
+		err = fuse_uring_queue_handle_cqes(queue);
+
+		atomic_store_explicit(&queue->cqe_processing, false,
+				      memory_order_relaxed);
+
+		if (err < 0) {
+			fuse_session_exit(se);
+			continue;
+		}
+
+		/*
+		 * Multi-issuer does not use io_uring_submit_and_wait(),
+		 * but io_uring_wait_cqe() and locked io_uring_submit().
+		 */
+		if (!single_issuer) {
+			pthread_mutex_lock(&queue->ring_lock);
+			fuse_uring_submit(queue, 0);
+			pthread_mutex_unlock(&queue->ring_lock);
+		}
+	}
+
+out:
+	return NULL;
+}
+
+static int fuse_uring_start_ring_threads(struct fuse_ring_pool *ring)
+{
+	int rc = 0;
+
+	for (size_t qid = 0; qid < ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(ring, qid);
+
+		rc = pthread_create(&queue->tid, NULL, fuse_uring_thread, queue);
+		if (rc != 0)
+			break;
+	}
+
+	return rc;
+}
+
+static int fuse_uring_sanity_check(const struct fuse_session *se)
+{
+	if (se->uring.q_depth == 0) {
+		fuse_log(FUSE_LOG_ERR, "io-uring queue depth must be > 0\n");
+		return -EINVAL;
+	}
+
+	_Static_assert(sizeof(struct fuse_uring_cmd_req) <=
+		       FUSE_URING_MAX_SQE128_CMD_DATA,
+		       "SQE128_CMD_DATA has 80B cmd data");
+
+	return 0;
+}
+
+int fuse_uring_start(struct fuse_session *se)
+{
+	int err = 0;
+	struct fuse_ring_pool *fuse_ring;
+
+	err = fuse_uring_sanity_check(se);
+	if (err)
+		return err;
+
+	fuse_ring = fuse_create_ring(se);
+	if (fuse_ring == NULL) {
+		err = -EADDRNOTAVAIL;
+		goto err;
+	}
+
+	se->uring.pool = fuse_ring;
+	err = fuse_uring_start_ring_threads(fuse_ring);
+	if (err)
+		goto err;
+
+	/*
+	 * Wait for all threads to start or to fail
+	 */
+	pthread_mutex_lock(&fuse_ring->thread_start_mutex);
+	while (fuse_ring->started_threads < fuse_ring->nr_queues)
+		pthread_cond_wait(&fuse_ring->thread_start_cond,
+				  &fuse_ring->thread_start_mutex);
+
+	if (fuse_ring->failed_threads != 0)
+		err = -EADDRNOTAVAIL;
+	pthread_mutex_unlock(&fuse_ring->thread_start_mutex);
+
+err:
+	if (err) {
+		/* Note all threads need to have been started */
+		if (fuse_ring)
+			fuse_session_destruct_uring(fuse_ring);
+		se->uring.pool = NULL;
+	}
+	return err;
+}
+
+int fuse_uring_stop(struct fuse_session *se)
+{
+	struct fuse_ring_pool *ring = se->uring.pool;
+
+	if (ring == NULL)
+		return 0;
+
+	fuse_session_destruct_uring(ring);
+	se->uring.pool = NULL;
+
+	return 0;
+}
+
+void fuse_uring_wake_ring_threads(struct fuse_session *se)
+{
+	struct fuse_ring_pool *ring = se->uring.pool;
+
+	/* Wake up the threads to let them send SQEs */
+	for (size_t qid = 0; qid < ring->nr_queues; qid++)
+		sem_post(&ring->init_sem);
+}

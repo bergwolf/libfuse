@@ -11,6 +11,7 @@
 #include <utime.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -46,8 +47,10 @@ static int testdatalen = sizeof(testdata) - 1;
 static int testdata2len = sizeof(testdata2) - 1;
 static unsigned int testnum = 0;
 static unsigned int select_test = 0;
-static unsigned int skip_test = 0;
+static unsigned int skip_tests[8];
+static unsigned int num_skip_tests;
 static unsigned int unlinked_test = 0;
+static int realdir_fd = -1;
 
 #define MAX_ENTRIES 1024
 #define MAX_TESTS 100
@@ -84,37 +87,84 @@ static int is_dot_or_dotdot(const char *name) {
            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
 
+/*
+ * Seconds since the first line this process printed. The origin is taken
+ * lazily so it needs no init call and cannot precede the first test.
+ */
+static double test_elapsed(void)
+{
+	static struct timespec start;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (start.tv_sec == 0 && start.tv_nsec == 0)
+		start = now;
+	return (now.tv_sec - start.tv_sec) +
+	       (now.tv_nsec - start.tv_nsec) / 1e9;
+}
+
 static void success(void)
 {
-	fprintf(stderr, "%s OK\n", testname);
+	fprintf(stderr, "+%8.3fs %s OK\n", test_elapsed(), testname);
+}
+
+static int test_skipped(unsigned int num)
+{
+	unsigned int idx;
+
+	for (idx = 0; idx < num_skip_tests; idx++) {
+		if (skip_tests[idx] == num)
+			return 1;
+	}
+	return 0;
 }
 
 #define this_test (&tests[testnum-1])
 #define next_test (&tests[testnum])
 
+/*
+ * Expected errnos when operating on an O_PATH fd whose FUSE inode is
+ * stale or has been forgotten by the daemon (e.g. after unlink).
+ */
+#define is_fuse_inode_bad_errno(e) \
+	((e) == ESTALE || (e) == EIO || (e) == ENOENT || (e) == EBADF)
+
+/*
+ * Expected errnos when the FUSE daemon has crashed (abort).
+ */
+#define is_fuse_daemon_dead_errno(e) \
+	((e) == ENOTCONN || (e) == ECONNABORTED)
+
 static void __start_test(const char *fmt, ...)
 {
 	unsigned int n;
 	va_list ap;
-	n = sprintf(testname, "%3i [", testnum);
+	n = snprintf(testname, sizeof(testname), "%3u [", testnum);
 	va_start(ap, fmt);
-	n += vsprintf(testname + n, fmt, ap);
+	if (n < sizeof(testname))
+		n += vsnprintf(testname + n, sizeof(testname) - n, fmt, ap);
 	va_end(ap);
-	sprintf(testname + n, "]");
+	if (n < sizeof(testname))
+		snprintf(testname + n, sizeof(testname) - n, "]");
 	// Use dedicated testfile per test
-	sprintf(testfile, "%s/testfile.%d", basepath, testnum);
-	sprintf(testfile_r, "%s/testfile.%d", basepath_r, testnum);
+	snprintf(testfile, sizeof(testfile), "%s/testfile.%u", basepath, testnum);
+	snprintf(testfile_r, sizeof(testfile_r), "%s/testfile.%u", basepath_r, testnum);
 	if (testnum > MAX_TESTS) {
 		fprintf(stderr, "%s - too many tests\n", testname);
 		exit(1);
 	}
+	/* A test that never finishes prints nothing otherwise, leaving the log
+	 * ending at the last test that passed. stderr, so a SIGKILL cannot
+	 * swallow it.
+	 */
+	fprintf(stderr, "+%8.3fs %s START\n", test_elapsed(), testname);
 	this_test->fd = -1;
 }
 
 #define start_test(msg, args...) { \
 	testnum++; \
 	if ((select_test && testnum != select_test) || \
-	    (testnum == skip_test)) { \
+	    test_skipped(testnum)) { \
 		return 0; \
 	} \
 	__start_test(msg, ##args);		\
@@ -152,7 +202,7 @@ static int check_testfile_size(const char *path, int len)
 	return check_size(path, len);
 }
 
-static int st_check_type(struct stat *st, mode_t type)
+static int st_check_type(const struct stat *st, mode_t type)
 {
 	if ((st->st_mode & S_IFMT) != type) {
 		ERROR("type 0%o instead of 0%o", st->st_mode & S_IFMT, type);
@@ -172,7 +222,7 @@ static int check_type(const char *path, mode_t type)
 	return st_check_type(&stbuf, type);
 }
 
-static int st_check_mode(struct stat *st, mode_t mode)
+static int st_check_mode(const struct stat *st, mode_t mode)
 {
 	if ((st->st_mode & ALLPERMS) != mode) {
 		ERROR("mode 0%o instead of 0%o", st->st_mode & ALLPERMS,
@@ -277,8 +327,7 @@ static int fcheck_stat(int fd, int flags, struct stat *st)
 		if (flags & O_PATH) {
 			// With O_PATH fd, the server does not have to keep
 			// the inode alive so FUSE inode may be stale or bad
-			if (errno == ESTALE || errno == EIO ||
-			    errno == ENOENT || errno == EBADF)
+			if (is_fuse_inode_bad_errno(errno))
 				return 0;
 		}
 		PERROR("fstat");
@@ -365,14 +414,13 @@ static int fcheck_data(int fd, const char *data, int offset,
 		       unsigned len)
 {
 	char buf[4096];
-	int res;
 	if (lseek(fd, offset, SEEK_SET) == (off_t) -1) {
 		PERROR("lseek");
 		return -1;
 	}
 	while (len) {
 		int rdlen = len < sizeof(buf) ? len : sizeof(buf);
-		res = read(fd, buf, rdlen);
+		int res = read(fd, buf, rdlen);
 		if (res == -1) {
 			PERROR("read");
 			return -1;
@@ -565,7 +613,6 @@ static int check_unlinked_testfile(int fd)
 // Check recorded testfiles after all tests completed
 static int check_unlinked_testfiles(void)
 {
-	int fd;
 	int res, err = 0;
 	int num = testnum;
 
@@ -574,7 +621,7 @@ static int check_unlinked_testfiles(void)
 
 	testnum = 0;
 	while (testnum < num) {
-		fd = next_test->fd;
+		int fd = next_test->fd;
 		start_test("check_unlinked_testfile");
 		if (fd == -1)
 			continue;
@@ -603,7 +650,7 @@ static int cleanup_dir(const char *path, const char **dir_files, int quiet)
 	for (i = 0; dir_files[i]; i++) {
 		int res;
 		char fpath[1280];
-		sprintf(fpath, "%s/%s", path, dir_files[i]);
+		snprintf(fpath, sizeof(fpath), "%s/%s", path, dir_files[i]);
 		res = unlink(fpath);
 		if (res == -1 && !quiet) {
 			PERROR("unlink");
@@ -636,7 +683,7 @@ static int create_dir(const char *path, const char **dir_files)
 
 	for (i = 0; dir_files[i]; i++) {
 		char fpath[1280];
-		sprintf(fpath, "%s/%s", path, dir_files[i]);
+		snprintf(fpath, sizeof(fpath), "%s/%s", path, dir_files[i]);
 		res = create_file(fpath, "", 0);
 		if (res == -1) {
 			cleanup_dir(path, dir_files, 1);
@@ -773,7 +820,7 @@ static int test_seekdir(void)
 	int i;
 	int res;
 	DIR *dp;
-	struct dirent *de;
+	const struct dirent *de = NULL;
 
 	start_test("seekdir");
 	res = create_dir(testdir, testdir_files);
@@ -908,14 +955,59 @@ static int test_copy_file_range(void)
 	res = check_nonexist(testfile2);
 	if (res == -1)
 		return -1;
-	if (err)
-		return -1;
 
 	success();
 	return 0;
 }
 #else
 static int test_copy_file_range(void)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_STATX
+static int test_statx(void)
+{
+	struct statx sb;
+	char msg[] = "hi";
+	size_t msg_size = sizeof(msg);
+	struct timespec tp;
+	int res;
+
+	memset(&sb, 0, sizeof(sb));
+	unlink(testfile);
+
+	start_test("statx");
+
+	res = create_testfile(testfile, msg, msg_size);
+	if (res == -1)
+		return -1;
+
+	res = statx(-1, testfile, AT_EMPTY_PATH,
+		    STATX_BASIC_STATS | STATX_BTIME, &sb);
+	if (res == -1)
+		return -1;
+
+	if (sb.stx_size != msg_size)
+		return -1;
+
+	clock_gettime(CLOCK_REALTIME, &tp);
+
+	if (sb.stx_btime.tv_sec > tp.tv_sec)
+		return -1;
+
+	if (sb.stx_btime.tv_sec == tp.tv_sec &&
+	    sb.stx_btime.tv_nsec >= tp.tv_nsec)
+		return -1;
+
+	unlink(testfile);
+
+	success();
+	return 0;
+}
+#else
+static int test_statx(void)
 {
 	return 0;
 }
@@ -1065,12 +1157,15 @@ static int test_create_unlink(void)
 	return 0;
 }
 
-#ifndef __FreeBSD__
 static int test_mknod(void)
 {
 	int err = 0;
 	int res;
 
+#ifdef __FreeBSD__
+	/* mknod(2) refuses S_IFREG here */
+	return 0;
+#endif
 	start_test("mknod");
 	unlink(testfile);
 	res = mknod(testfile, 0644, 0);
@@ -1098,7 +1193,6 @@ static int test_mknod(void)
 	success();
 	return 0;
 }
-#endif
 
 #define test_open(exist, flags, mode)  do_test_open(exist, flags, #flags, mode)
 
@@ -1792,7 +1886,6 @@ fail:
 #undef PATH
 }
 
-#ifndef __FreeBSD__
 static int test_mkfifo(void)
 {
 	int res;
@@ -1824,7 +1917,6 @@ static int test_mkfifo(void)
 	success();
 	return 0;
 }
-#endif
 
 static int test_mkdir(void)
 {
@@ -1957,15 +2049,329 @@ static int do_test_create_ro_dir(int flags, const char *flags_str)
 	return 0;
 }
 
+#ifndef __FreeBSD__
+/* 	this tests open with O_TMPFILE
+	note that this will only work with the fuse low level api 
+	you will get ENOTSUP with the high level api */
+static int test_create_tmpfile(void) 
+{
+	rmdir(testdir);
+	int res = mkdir(testdir, 0777);
+	if (res)
+		return -1;
+	
+	start_test("create tmpfile");
+
+	int fd = open(testdir, O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		if (errno == ENOTSUP) {
+			/* don't bother if we're working on an old kernel 
+					or on the high level API */
+			return 0;
+		}
+
+		PERROR("open O_TMPFILE | O_RDWR");
+		return -1;
+	}
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_WRONLY | O_EXCL, S_IRUSR | S_IWUSR);
+	if(fd == -1){
+		PERROR("open with O_TMPFILE | O_WRONLY | O_EXCL");
+		return -1;
+	};
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_RDONLY, S_IRUSR);
+	if (fd != -1) {
+		ERROR("open with O_TMPFILE | O_RDONLY succeeded");
+		return -1;
+	}
+	
+	success();
+	return 0;	
+}
+
+static int test_create_and_link_tmpfile(void) 
+{
+	/* skip this test for now since the github runner will fail in the linkat call below */
+	return 0;
+
+	rmdir(testdir);
+	unlink(testfile);
+
+	int res = mkdir(testdir, 0777);
+	if (res)
+		return -1;
+
+	start_test("create and link tmpfile");
+
+	int fd = open(testdir, O_TMPFILE | O_RDWR | O_EXCL, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		if (errno == ENOTSUP) {
+			/* don't bother if we're working on an old kernel
+				or on the high level API */
+			return 0;
+		}
+		PERROR("open with O_TMPFILE | O_RDWR | O_EXCL");
+		return -1;
+	}
+
+	if (!linkat(fd, "", AT_FDCWD, testfile, AT_EMPTY_PATH)) {
+		ERROR("linkat succeeded on a tmpfile opened with O_EXCL");
+		return -1;
+	}
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		PERROR("open O_TMPFILE");
+		return -1;
+	}
+	
+	if (check_nonexist(testfile)) {
+		return -1;
+	}
+
+	if (linkat(fd, "", AT_FDCWD, testfile, AT_EMPTY_PATH)) {
+		PERROR("linkat tempfile");
+		return -1;
+	}
+	close(fd);
+
+	if (check_nlink(testfile, 1)) {
+		return -1;
+	}
+	unlink(testfile);
+
+	success();
+	return 0;
+}
+
+/*
+ * Stress test for the lookup/forget race in passthrough_hp.
+ *
+ * When forget_one() and do_lookup() concurrently process the same source
+ * inode number (recycled with a new generation), do_lookup may find the
+ * inode in the map and increment nlookup while forget_one is erasing it.
+ * This was fixed by upstream commit:
+ *   1e19235c - fix race between forget_one and do_lookup
+ *
+ * Scenario: old file is unlinked and a new file recycles the same source
+ * inode number.  Closing the last fd to the old (unlinked) file triggers
+ * an immediate FORGET for the old inode.  A concurrent LOOKUP for the new
+ * file finds the same source ino (different generation) in the FUSE inode
+ * map while FORGET is tearing it down.
+ *
+ * Without the race fix, do_lookup may increment nlookup on an inode that
+ * forget_one has just erased (use-after-free).  This causes either:
+ *   - "INTERNAL ERROR: Negative lookup count" → abort()
+ *   - "INTERNAL ERROR: Unknown inode" → abort()
+ * Both crash the daemon.
+ *
+ * With the fix, nlookup is incremented under fs.m before releasing
+ * the lock, so the race is eliminated entirely.
+ *
+ * Requires -u flag (recent kernel with inode reuse fix) and realdir.
+ */
+#define RACE_FILES 20
+#define RACE_ITERS 50
+
+static int test_lookup_forget_race(void)
+{
+	int i, iter, err = 0;
+	int res;
+	int recycled = 0, total = 0;
+	int path_fds[RACE_FILES];
+	ino_t old_inos[RACE_FILES];
+
+	start_test("lookup_forget_race");
+
+	if (!unlinked_test || realdir_fd < 0) {
+		fprintf(stderr, "%s SKIP\n", testname);
+		return 0;
+	}
+
+	for (iter = 0; iter < RACE_ITERS; iter++) {
+		/*
+		 * Phase 1: Create files in source dir, look them up via mount,
+		 * and hold O_PATH fds so the FUSE inodes stay alive.
+		 */
+		for (i = 0; i < RACE_FILES; i++) {
+			char name[64], mpath[1280];
+			struct stat st;
+			int fd;
+
+			sprintf(name, "racefile.%d", i);
+			sprintf(mpath, "%s/%s", basepath, name);
+
+			fd = openat(realdir_fd, name,
+				    O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				PERROR("creat racefile");
+				err = -1;
+				goto out;
+			}
+			close(fd);
+
+			path_fds[i] = open(mpath, O_PATH);
+			if (path_fds[i] < 0) {
+				if (is_fuse_daemon_dead_errno(errno))
+					goto daemon_crashed;
+				if (is_fuse_inode_bad_errno(errno)) {
+					path_fds[i] = -1;
+					old_inos[i] = 0;
+					continue;
+				}
+				PERROR("open(O_PATH)");
+				err = -1;
+				goto out;
+			}
+			if (fstat(path_fds[i], &st) < 0) {
+				if (is_fuse_daemon_dead_errno(errno))
+					goto daemon_crashed;
+				if (is_fuse_inode_bad_errno(errno)) {
+					close(path_fds[i]);
+					path_fds[i] = -1;
+					old_inos[i] = 0;
+					continue;
+				}
+				PERROR("fstat");
+				close(path_fds[i]);
+				err = -1;
+				goto out;
+			}
+			old_inos[i] = st.st_ino;
+		}
+
+		/*
+		 * Phase 2: Unlink the old files via the mount.  The inodes
+		 * stay alive in the FUSE daemon because the O_PATH fds
+		 * prevent the kernel from sending FORGET.
+		 */
+		for (i = 0; i < RACE_FILES; i++) {
+			char mpath[1280];
+			sprintf(mpath, "%s/racefile.%d", basepath, i);
+			unlink(mpath);
+		}
+
+		/*
+		 * Phase 3: Create new files directly in the source dir.
+		 * The filesystem may recycle the inode numbers that were
+		 * just freed.  Give the filesystem (e.g. XFS) time to
+		 * process the unlinked inode list so inodes are eligible
+		 * for reuse.
+		 */
+		syncfs(realdir_fd);
+		usleep(1000);
+		for (i = 0; i < RACE_FILES; i++) {
+			char name[64];
+			int fd;
+
+			sprintf(name, "racefile.%d", i);
+			fd = openat(realdir_fd, name,
+				    O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				PERROR("creat new racefile");
+				err = -1;
+				goto out;
+			}
+			close(fd);
+		}
+
+		/*
+		 * Phase 4: Close the old O_PATH fds in a burst — each close
+		 * triggers FORGET for the old inode (nlookup drops to 0).
+		 *
+		 * Phase 5: Immediately stat all new files via the mount in a
+		 * burst — each stat triggers LOOKUP.  If a new file recycled
+		 * an old inode number, the LOOKUP and FORGET for the same
+		 * source ino race in the FUSE daemon's thread pool.
+		 *
+		 * Closing all fds first maximises the window: the daemon is
+		 * busy processing N FORGETs when the LOOKUPs start arriving.
+		 */
+		for (i = 0; i < RACE_FILES; i++)
+			if (path_fds[i] >= 0)
+				close(path_fds[i]);
+
+		for (i = 0; i < RACE_FILES; i++) {
+			struct stat st;
+			char mpath[1280];
+
+			/* Skipped in phase 1 (stale inode) */
+			if (path_fds[i] < 0)
+				continue;
+
+			sprintf(mpath, "%s/racefile.%d", basepath, i);
+			res = stat(mpath, &st);
+			if (res < 0) {
+				if (is_fuse_daemon_dead_errno(errno))
+					goto daemon_crashed;
+				/*
+				 * The file exists (created in phase 3).
+				 * Any error here means the race was hit.
+				 */
+				ERROR("racefile.%d iter %d: race hit (%s)",
+				      i, iter, strerror(errno));
+				err = -1;
+				goto out;
+			}
+
+			total++;
+			if (st.st_ino == old_inos[i])
+				recycled++;
+		}
+
+		/* Cleanup for next iteration */
+		for (i = 0; i < RACE_FILES; i++) {
+			char name[64];
+			sprintf(name, "racefile.%d", i);
+			unlinkat(realdir_fd, name, 0);
+		}
+	}
+
+out:
+	/* Final cleanup */
+	for (i = 0; i < RACE_FILES; i++) {
+		char name[64], mpath[1280];
+		sprintf(name, "racefile.%d", i);
+		unlinkat(realdir_fd, name, 0);
+		sprintf(mpath, "%s/racefile.%d", basepath, i);
+		unlink(mpath);
+	}
+
+	if (!err) {
+		fprintf(stderr, "%s recycled %d/%d inodes  ",
+			testname, recycled, total);
+		success();
+	}
+	return err;
+
+daemon_crashed:
+	/*
+	 * The daemon crashed (abort) due to the lookup/forget race.
+	 * This is the expected outcome without the fix.
+	 */
+	ERROR("daemon crashed (lookup/forget race triggered)");
+	return -1;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 	int err = 0;
 	int a;
 	int is_root;
 
+	/* Piped stdout is fully buffered, so a killed test loses whatever it
+	 * had printed about what it was doing.
+	 */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	umask(0);
-	if (argc < 2 || argc > 4) {
-		fprintf(stderr, "usage: %s testdir [:realdir] [[-]test#] [-u]\n", argv[0]);
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s testdir [:realdir] [test#] [-test#]... [-u]\n", argv[0]);
 		return 1;
 	}
 	basepath = argv[1];
@@ -1975,14 +2381,24 @@ int main(int argc, char *argv[])
 		char *arg = argv[a];
 		if (arg[0] == ':') {
 			basepath_r = arg + 1;
+			realdir_fd = open(basepath_r, O_DIRECTORY);
+			if (realdir_fd < 0) {
+				fprintf(stderr, "failed to open realdir '%s': %s\n",
+					basepath_r, strerror(errno));
+				return 1;
+			}
 		} else {
 			if (arg[0] == '-') {
 				arg++;
 				if (arg[0] == 'u') {
 					unlinked_test = 1;
 					endptr = arg + 1;
+				} else if (num_skip_tests == ARRAY_SIZE(skip_tests)) {
+					fprintf(stderr, "too many tests to skip\n");
+					return 1;
 				} else {
-					skip_test = strtoul(arg, &endptr, 10);
+					skip_tests[num_skip_tests++] =
+						strtoul(arg, &endptr, 10);
 				}
 			} else {
 				select_test = strtoul(arg, &endptr, 10);
@@ -1993,25 +2409,31 @@ int main(int argc, char *argv[])
 			}
 		}
 	}
-	assert(strlen(basepath) < 512);
-	assert(strlen(basepath_r) < 512);
 	if (basepath[0] != '/') {
 		fprintf(stderr, "testdir must be an absolute path\n");
 		return 1;
 	}
+	if (strlen(basepath) > 1000) {
+		fprintf(stderr, "testdir path is too long\n");
+		return 1;
+	}
+	if (strlen(basepath_r) > 1000) {
+		fprintf(stderr, "realdir path is too long\n");
+		return 1;
+	}
 
-	sprintf(testfile, "%s/testfile", basepath);
-	sprintf(testfile2, "%s/testfile2", basepath);
-	sprintf(testdir, "%s/testdir", basepath);
-	sprintf(testdir2, "%s/testdir2", basepath);
-	sprintf(subfile, "%s/subfile", testdir2);
-	sprintf(testsock, "%s/testsock", basepath);
+	snprintf(testfile, sizeof(testfile), "%s/testfile", basepath);
+	snprintf(testfile2, sizeof(testfile2), "%s/testfile2", basepath);
+	snprintf(testdir, sizeof(testdir), "%s/testdir", basepath);
+	snprintf(testdir2, sizeof(testdir2), "%s/testdir2", basepath);
+	snprintf(subfile, sizeof(subfile), "%s/subfile", testdir2);
+	snprintf(testsock, sizeof(testsock), "%s/testsock", basepath);
 
-	sprintf(testfile_r, "%s/testfile", basepath_r);
-	sprintf(testfile2_r, "%s/testfile2", basepath_r);
-	sprintf(testdir_r, "%s/testdir", basepath_r);
-	sprintf(testdir2_r, "%s/testdir2", basepath_r);
-	sprintf(subfile_r, "%s/subfile", testdir2_r);
+	snprintf(testfile_r, sizeof(testfile_r), "%s/testfile", basepath_r);
+	snprintf(testfile2_r, sizeof(testfile2_r), "%s/testfile2", basepath_r);
+	snprintf(testdir_r, sizeof(testdir_r), "%s/testdir", basepath_r);
+	snprintf(testdir2_r, sizeof(testdir2_r), "%s/testdir2", basepath_r);
+	snprintf(subfile_r, sizeof(subfile_r), "%s/subfile", testdir2_r);
 
 	is_root = (geteuid() == 0);
 
@@ -2020,10 +2442,8 @@ int main(int argc, char *argv[])
 	err += test_symlink();
 	err += test_link();
 	err += test_link2();
-#ifndef __FreeBSD__	
 	err += test_mknod();
 	err += test_mkfifo();
-#endif
 	err += test_mkdir();
 	err += test_rename_file();
 	err += test_rename_dir();
@@ -2069,7 +2489,9 @@ int main(int argc, char *argv[])
 	err += test_open_acc(O_WRONLY, 0600, 0);
 	err += test_open_acc(O_RDWR,   0600, 0);
 	err += test_open_acc(O_RDONLY, 0400, 0);
+#ifndef __FreeBSD__
 	err += test_open_acc(O_WRONLY, 0200, 0);
+#endif
 	if(!is_root) {
 		err += test_open_acc(O_RDONLY | O_TRUNC, 0400, EACCES);
 		err += test_open_acc(O_WRONLY, 0400, EACCES);
@@ -2085,6 +2507,12 @@ int main(int argc, char *argv[])
 	err += test_create_ro_dir(O_CREAT | O_WRONLY);
 	err += test_create_ro_dir(O_CREAT | O_TRUNC);
 	err += test_copy_file_range();
+	err += test_statx();
+#ifndef __FreeBSD__
+	err += test_create_tmpfile();
+	err += test_create_and_link_tmpfile();
+	err += test_lookup_forget_race();
+#endif
 
 	unlink(testfile2);
 	unlink(testsock);

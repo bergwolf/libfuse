@@ -11,6 +11,7 @@ bindir="$2"
 udevrulesdir="$3"
 useroot="$4"
 initscriptdir="$5"
+sbindir="$6"
 
 # Both sysconfdir and bindir are absolute paths (since they are joined
 # with --prefix in meson.build), but need to be interpreted relative
@@ -31,14 +32,21 @@ if $useroot; then
     chown root:root "${DESTDIR}${bindir}/fusermount3"
     chmod u+s "${DESTDIR}${bindir}/fusermount3"
 
+    if [ -e "${DESTDIR}${sbindir}/fuservicemount3" ]; then
+        chown root:root "${DESTDIR}${sbindir}/fuservicemount3"
+        chmod u+s "${DESTDIR}${sbindir}/fuservicemount3"
+    fi
+
     if test ! -e "${DESTDIR}/dev/fuse"; then
         mkdir -p "${DESTDIR}/dev"
         mknod "${DESTDIR}/dev/fuse" -m 0666 c 10 229
     fi
 fi
 
-install -D -m 644 "${MESON_SOURCE_ROOT}/util/udev.rules" \
+if [ "${udevrulesdir}" != "" ]; then
+    install -D -m 644 "${MESON_SOURCE_ROOT}/util/udev.rules" \
         "${DESTDIR}${udevrulesdir}/99-fuse3.rules"
+fi
 
 if [ "$initscriptdir" != "" ]; then
     install -D -m 755 "${MESON_SOURCE_ROOT}/util/init_script" \

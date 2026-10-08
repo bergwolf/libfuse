@@ -3,7 +3,7 @@
   Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 /** @file
@@ -14,13 +14,18 @@
  *
  *     gcc -Wall hello_ll.c `pkg-config fuse3 --cflags --libs` -o hello_ll
  *
+ * Note: If the pkg-config command fails due to the absence of the fuse3.pc
+ *     file, you should configure the path to the fuse3.pc file in the
+ *     PKG_CONFIG_PATH variable.
+ *
  * ## Source code ##
  * \include hello_ll.c
  */
 
-#define FUSE_USE_VERSION 34
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 19)
 
 #include <fuse_lowlevel.h>
+#include <fuse_daemonize.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +56,17 @@ static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
 		return -1;
 	}
 	return 0;
+}
+
+static void hello_ll_init(void *userdata, struct fuse_conn_info *conn)
+{
+	(void)userdata;
+
+	/* Always replies inline on the io-uring worker thread */
+	fuse_set_conn_flag(conn, FUSE_CONN_FLAG_SINGLE_ISSUER);
+
+	/* Disable the receiving and processing of FUSE_INTERRUPT requests */
+	fuse_set_conn_flag(conn, FUSE_CONN_FLAG_NO_INTERRUPT);
 }
 
 static void hello_ll_getattr(fuse_req_t req, fuse_ino_t ino,
@@ -153,12 +169,64 @@ static void hello_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	reply_buf_limited(req, hello_str, strlen(hello_str), off, size);
 }
 
+static void hello_ll_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+							  size_t size)
+{
+	(void)size;
+	assert(ino == 1 || ino == 2);
+	if (strcmp(name, "hello_ll_getxattr_name") == 0)
+	{
+		const char *buf = "hello_ll_getxattr_value";
+		fuse_reply_buf(req, buf, strlen(buf));
+	}
+	else
+	{
+		fuse_reply_err(req, ENOTSUP);
+	}
+}
+
+static void hello_ll_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+							  const char *value, size_t size, int flags)
+{
+	(void)flags;
+	(void)size;
+	assert(ino == 1 || ino == 2);
+	const char* exp_val = "hello_ll_setxattr_value";
+	if (strcmp(name, "hello_ll_setxattr_name") == 0 &&
+	    strlen(exp_val) == size &&
+	    strncmp(value, exp_val, size) == 0)
+	{
+		fuse_reply_err(req, 0);
+	}
+	else
+	{
+		fuse_reply_err(req, ENOTSUP);
+	}
+}
+
+static void hello_ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
+{
+	assert(ino == 1 || ino == 2);
+	if (strcmp(name, "hello_ll_removexattr_name") == 0)
+	{
+		fuse_reply_err(req, 0);
+	}
+	else
+	{
+		fuse_reply_err(req, ENOTSUP);
+	}
+}
+
 static const struct fuse_lowlevel_ops hello_ll_oper = {
-	.lookup		= hello_ll_lookup,
-	.getattr	= hello_ll_getattr,
-	.readdir	= hello_ll_readdir,
-	.open		= hello_ll_open,
-	.read		= hello_ll_read,
+	.init = hello_ll_init,
+	.lookup = hello_ll_lookup,
+	.getattr = hello_ll_getattr,
+	.readdir = hello_ll_readdir,
+	.open = hello_ll_open,
+	.read = hello_ll_read,
+	.setxattr = hello_ll_setxattr,
+	.getxattr = hello_ll_getxattr,
+	.removexattr = hello_ll_removexattr,
 };
 
 int main(int argc, char *argv[])
@@ -166,7 +234,7 @@ int main(int argc, char *argv[])
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse_session *se;
 	struct fuse_cmdline_opts opts;
-	struct fuse_loop_config config;
+	struct fuse_loop_config *config;
 	int ret = -1;
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
@@ -199,18 +267,25 @@ int main(int argc, char *argv[])
 	if (fuse_set_signal_handlers(se) != 0)
 	    goto err_out2;
 
+	if (fuse_daemonize_early_start(opts.foreground ?
+				       FUSE_DAEMONIZE_NO_BACKGROUND : 0) != 0)
+		goto err_out3;
+
 	if (fuse_session_mount(se, opts.mountpoint) != 0)
 	    goto err_out3;
 
-	fuse_daemonize(opts.foreground);
+	fuse_daemonize_early_success();
 
 	/* Block until ctrl+c or fusermount -u */
 	if (opts.singlethread)
 		ret = fuse_session_loop(se);
 	else {
-		config.clone_fd = opts.clone_fd;
-		config.max_idle_threads = opts.max_idle_threads;
-		ret = fuse_session_loop_mt(se, &config);
+		config = fuse_loop_cfg_create();
+		fuse_loop_cfg_set_clone_fd(config, opts.clone_fd);
+		fuse_loop_cfg_set_max_threads(config, opts.max_threads);
+		ret = fuse_session_loop_mt(se, config);
+		fuse_loop_cfg_destroy(config);
+		config = NULL;
 	}
 
 	fuse_session_unmount(se);

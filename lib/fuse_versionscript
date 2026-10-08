@@ -83,7 +83,6 @@ FUSE_3.0 {
 		fuse_fs_unlink;
 		fuse_fs_utimens;
 		fuse_fs_write;
-		fuse_register_module;
 		fuse_reply_iov;
 		fuse_version;
 		fuse_pkgversion;
@@ -161,7 +160,6 @@ FUSE_3.3 {
 FUSE_3.4 {
 	global:
 		fuse_fs_copy_file_range;
-		fuse_reply_copy_file_range;
 } FUSE_3.3;
 
 FUSE_3.7 {
@@ -188,6 +186,83 @@ FUSE_3.12 {
 		fuse_parse_cmdline_312;
 		fuse_lowlevel_notify_expire_entry;
 } FUSE_3.4;
+
+FUSE_3.17 {
+	global:
+		fuse_main_real_versioned;
+		fuse_session_new_versioned;
+		_fuse_new_30;
+		_fuse_new_31;
+		fuse_passthrough_open;
+		fuse_passthrough_close;
+		fuse_session_custom_io_30;
+		fuse_session_custom_io_317;
+		fuse_set_fail_signal_handlers;
+		fuse_log_enable_syslog;
+		fuse_log_close_syslog;
+} FUSE_3.12;
+
+FUSE_3.17.3 {
+	global:
+		fuse_set_feature_flag;
+		fuse_unset_feature_flag;
+		fuse_get_feature_flag;
+
+		# Not part of public API, for internal testing only
+		fuse_convert_to_conn_want_ext;
+} FUSE_3.17;
+
+FUSE_3.18 {
+	global:
+		fuse_req_is_uring;
+		fuse_req_get_payload;
+		fuse_lowlevel_notify_increment_epoch;
+
+		fuse_reply_statx;
+		fuse_fs_statx;
+} FUSE_3.17;
+
+FUSE_3.19 {
+	global:
+		fuse_set_conn_flag;
+		fuse_session_start_teardown_watchdog;
+		fuse_session_stop_teardown_watchdog;
+		fuse_lowlevel_notify_prune;
+		fuse_daemonize_early_start;
+		fuse_daemonize_early_success;
+		fuse_daemonize_early_fail;
+		fuse_daemonize_early_is_active;
+		fuse_session_set_debug;
+		fuse_session_set_sync_init;
+		fuse_service_accept;
+		fuse_service_append_args;
+		fuse_service_can_allow_other;
+		fuse_service_can_fuseblk;
+		fuse_service_cmdline;
+		fuse_service_destroy;
+		fuse_service_exit;
+		fuse_service_expect_mount_format;
+		fuse_service_finish_file_requests;
+		fuse_service_main_real_versioned;
+		fuse_service_parse_cmdline_opts;
+		fuse_service_receive_file;
+		fuse_service_release;
+		fuse_service_request_file;
+		fuse_service_request_blockdev;
+		fuse_service_send_goodbye;
+		fuse_service_session_mount;
+		fuse_req_secctx_count;
+		fuse_req_secctx_reset;
+		fuse_req_secctx_next;
+
+		cuse_lowlevel_new_319;
+		cuse_lowlevel_setup_319;
+		cuse_lowlevel_main_30;
+		cuse_lowlevel_main_319;
+
+		fuse_session_loop_319;
+		fuse_loop_319;
+} FUSE_3.18;
 
 # Local Variables:
 # indent-tabs-mode: t

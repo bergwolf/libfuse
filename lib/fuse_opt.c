@@ -6,7 +6,7 @@
   fuse_args`).
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB
+  See the file LGPL2.txt
 */
 
 #include "fuse_config.h"
@@ -170,10 +170,10 @@ static int call_proc(struct fuse_opt_context *ctx, const char *arg, int key,
 
 static int match_template(const char *t, const char *arg, unsigned *sepp)
 {
-	int arglen = strlen(arg);
 	const char *sep = strchr(t, '=');
 	sep = sep ? sep : strchr(t, ' ');
 	if (sep && (!sep[1] || sep[1] == '%')) {
+		int arglen = strlen(arg);
 		int tlen = sep - t;
 		if (sep[0] == '=')
 			tlen ++;
@@ -253,18 +253,20 @@ static int process_opt_sep_arg(struct fuse_opt_context *ctx,
 {
 	int res;
 	char *newarg;
-	char *param;
+	const char *param;
+	size_t newarglen;
 
 	if (next_arg(ctx, arg) == -1)
 		return -1;
 
 	param = ctx->argv[ctx->argctr];
-	newarg = malloc(sep + strlen(param) + 1);
+	newarglen = sep + strlen(param) + 1;
+	newarg = malloc(newarglen);
 	if (!newarg)
 		return alloc_failed();
 
 	memcpy(newarg, arg, sep);
-	strcpy(newarg + sep, param);
+	snprintf(newarg + sep, newarglen - sep, "%s", param);
 	res = process_opt(ctx, opt, sep, newarg, iso);
 	free(newarg);
 

@@ -1,0 +1,58 @@
+---
+name: 'libfuse ABI check against previous major release'
+
+on:
+  push:
+    branches:
+      - master
+      - 'fuse-[0-9]+.[0-9]+*'  # This will match branches like 3.17, 3.18, 4.0, etc.
+  pull_request:
+    branches:
+      - master
+      - 'fuse-[0-9]+.[0-9]+*'
+permissions:
+  contents: read
+
+jobs:
+  abi:
+    runs-on: '${{ matrix.os }}'
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: current
+          fetch-depth: 0  # Fetch all history and tags
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          ./current/.github/workflows/install-ubuntu-dependencies.sh --abicheck
+
+      - name: Determine previous major release tag
+        id: prev_release
+        run: |
+          cd current
+          PREV_TAG=$(.github/workflows/find_previous_release_tag.sh)
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: previous
+          ref: ${{ steps.prev_release.outputs.prev_tag }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r current/requirements.txt
+
+      - name: Run ABI check
+        run: |
+          echo "Previous release tag: ${{ steps.prev_release.outputs.prev_tag }}"
+          current/.github/workflows/abicheck.sh --current-dir current --previous-dir previous

@@ -7,7 +7,7 @@
   file system by implementing nothing but the request handlers.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB.
+  See the file LGPL2.txt.
 */
 
 #include "fuse_config.h"
@@ -15,6 +15,9 @@
 #include "fuse_misc.h"
 #include "fuse_opt.h"
 #include "fuse_lowlevel.h"
+#include "fuse_daemonize.h"
+#include "fuse_daemonize_i.h"
+#include "fuse_service.h"
 #include "mount_util.h"
 
 #include <stdio.h>
@@ -25,6 +28,14 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/param.h>
+
+#undef fuse_loop
+int fuse_loop(struct fuse *f);
+
+#ifdef HAVE_SERVICEMOUNT
+# include <linux/types.h>
+# include "fuse_service_priv.h"
+#endif
 
 #define FUSE_HELPER_OPT(t, p) \
 	{ t, offsetof(struct fuse_cmdline_opts, p), 1 }
@@ -178,8 +189,7 @@ static int fuse_helper_opt_proc(void *data, const char *arg, int key,
    function actually sets the fsname */
 static int add_default_subtype(const char *progname, struct fuse_args *args)
 {
-	int res;
-	char *subtype_opt;
+	char subtype_opt[PATH_MAX];
 
 	const char *basename = strrchr(progname, '/');
 	if (basename == NULL)
@@ -187,19 +197,12 @@ static int add_default_subtype(const char *progname, struct fuse_args *args)
 	else if (basename[1] != '\0')
 		basename++;
 
-	subtype_opt = (char *) malloc(strlen(basename) + 64);
-	if (subtype_opt == NULL) {
-		fuse_log(FUSE_LOG_ERR, "fuse: memory allocation failed\n");
-		return -1;
-	}
 #ifdef __FreeBSD__
-	sprintf(subtype_opt, "-ofsname=%s", basename);
+	snprintf(subtype_opt, sizeof(subtype_opt), "-ofsname=%s", basename);
 #else
-	sprintf(subtype_opt, "-osubtype=%s", basename);
+	snprintf(subtype_opt, sizeof(subtype_opt), "-osubtype=%s", basename);
 #endif
-	res = fuse_opt_add_arg(args, subtype_opt);
-	free(subtype_opt);
-	return res;
+	return fuse_opt_add_arg(args, subtype_opt);
 }
 
 int fuse_parse_cmdline_312(struct fuse_args *args,
@@ -210,7 +213,7 @@ int fuse_parse_cmdline_312(struct fuse_args *args,
 {
 	memset(opts, 0, sizeof(struct fuse_cmdline_opts));
 
-	opts->max_idle_threads = -1; /* new default in fuse version 3.12 */
+	opts->max_idle_threads = UINT_MAX; /* new default in fuse version 3.12 */
 	opts->max_threads = 10;
 
 	if (fuse_opt_parse(args, opts, fuse_helper_opts,
@@ -228,6 +231,52 @@ int fuse_parse_cmdline_312(struct fuse_args *args,
 	return 0;
 }
 
+#ifdef HAVE_SERVICEMOUNT
+static int fuse_helper_opt_proc_service(void *data, const char *arg, int key,
+					struct fuse_args *outargs)
+{
+	(void) outargs;
+	struct fuse_cmdline_opts *opts = data;
+
+	switch (key) {
+	case FUSE_OPT_KEY_NONOPT:
+		if (!opts->mountpoint)
+			return fuse_opt_add_opt(&opts->mountpoint, arg);
+
+		fuse_log(FUSE_LOG_ERR, "fuse: invalid argument `%s'\n", arg);
+		return -1;
+	default:
+		/* Pass through unknown options */
+		return 1;
+	}
+}
+
+int fuse_parse_cmdline_service(struct fuse_args *args,
+			       struct fuse_cmdline_opts *opts)
+{
+	memset(opts, 0, sizeof(struct fuse_cmdline_opts));
+
+	opts->max_idle_threads = UINT_MAX; /* new default in fuse version 3.12 */
+	opts->max_threads = 10;
+
+	if (fuse_opt_parse(args, opts, fuse_helper_opts,
+			   fuse_helper_opt_proc_service) == -1)
+		return -1;
+
+	/*
+	 * *Linux*: if neither -o subtype nor -o fsname are specified,
+	 * set subtype to program's basename.
+	 * *FreeBSD*: if fsname is not specified, set to program's
+	 * basename.
+	 */
+	if (!opts->nodefault_subtype)
+		if (add_default_subtype(args->argv[0], args) == -1)
+			return -1;
+
+	return 0;
+}
+#endif
+
 /**
  * struct fuse_cmdline_opts got extended in libfuse-3.12
  */
@@ -238,7 +287,6 @@ int fuse_parse_cmdline_30(struct fuse_args *args,
 			  struct fuse_cmdline_opts *out_opts)
 {
 	struct fuse_cmdline_opts opts;
-
 
 	int rc = fuse_parse_cmdline_312(args, &opts);
 	if (rc == 0) {
@@ -251,68 +299,142 @@ int fuse_parse_cmdline_30(struct fuse_args *args,
 	return rc;
 }
 
-int fuse_daemonize(int foreground)
+struct fuse *_fuse_new_31(struct fuse_args *args,
+		       const struct fuse_operations *op, size_t op_size,
+		       struct libfuse_version *version,
+		       void *user_data);
+
+static uint32_t fuse_get_api_version(const struct libfuse_version *version)
 {
-	if (!foreground) {
-		int nullfd;
-		int waiter[2];
-		char completed;
+	uint32_t header_version =
+		FUSE_MAKE_VERSION(version->major, version->minor);
 
-		if (pipe(waiter)) {
-			perror("fuse_daemonize: pipe");
-			return -1;
-		}
+	if (version->api_version >= FUSE_MAKE_VERSION(3, 0) &&
+	    version->api_version <= header_version)
+		return version->api_version;
 
-		/*
-		 * demonize current process by forking it and killing the
-		 * parent.  This makes current process as a child of 'init'.
-		 */
-		switch(fork()) {
-		case -1:
-			perror("fuse_daemonize: fork");
-			return -1;
-		case 0:
-			break;
-		default:
-			(void) read(waiter[0], &completed, sizeof(completed));
-			_exit(0);
-		}
-
-		if (setsid() == -1) {
-			perror("fuse_daemonize: setsid");
-			return -1;
-		}
-
-		(void) chdir("/");
-
-		nullfd = open("/dev/null", O_RDWR, 0);
-		if (nullfd != -1) {
-			(void) dup2(nullfd, 0);
-			(void) dup2(nullfd, 1);
-			(void) dup2(nullfd, 2);
-			if (nullfd > 2)
-				close(nullfd);
-		}
-
-		/* Propagate completion of daemon initialization */
-		completed = 1;
-		(void) write(waiter[1], &completed, sizeof(completed));
-		close(waiter[0]);
-		close(waiter[1]);
-	} else {
-		(void) chdir("/");
-	}
-	return 0;
+	/* Missing metadata must retain pre-3.19 behavior. */
+	return FUSE_MAKE_VERSION(3, 0);
 }
 
-int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
-		   size_t op_size, void *user_data)
+static int fuse_loop_versioned(struct fuse *fuse,
+			       const struct libfuse_version *version)
+{
+	if (fuse_get_api_version(version) >= FUSE_MAKE_VERSION(3, 19))
+		return fuse_loop_319(fuse);
+
+	return fuse_loop(fuse);
+}
+
+int fuse_service_main_real_versioned(struct fuse_service *service,
+				     struct fuse_args *args,
+				     const struct fuse_operations *op,
+				     size_t op_size,
+				     struct libfuse_version *version,
+				     void *user_data)
+{
+	struct fuse *fuse;
+	struct fuse_cmdline_opts opts;
+	struct fuse_loop_config *loop_config = NULL;
+	int res;
+
+	if (fuse_service_parse_cmdline_opts(args, &opts) != 0) {
+		res = 1;
+		goto out0;
+	}
+
+	if (opts.show_version) {
+		printf("FUSE library version %s\n", PACKAGE_VERSION);
+		fuse_lowlevel_version();
+		res = 0;
+		goto out1;
+	}
+
+	if (opts.show_help) {
+		if (args->argv[0][0] != '\0')
+			printf("usage: %s [options] <mountpoint>\n\n",
+			       args->argv[0]);
+		printf("FUSE options:\n");
+		fuse_cmdline_help();
+		fuse_lib_help(args);
+		res = 0;
+		goto out1;
+	}
+
+	if (!opts.show_help &&
+	    !opts.mountpoint) {
+		fuse_log(FUSE_LOG_ERR, "error: no mountpoint specified\n");
+		res = 2;
+		goto out1;
+	}
+
+	fuse = _fuse_new_31(args, op, op_size, version, user_data);
+	if (fuse == NULL) {
+		res = 3;
+		goto out1;
+	}
+	struct fuse_session *se = fuse_get_session(fuse);
+
+	if (!opts.singlethread) {
+		loop_config = fuse_loop_cfg_create();
+		if (loop_config == NULL) {
+			res = 7;
+			goto out2;
+		}
+	}
+
+	if (fuse_set_signal_handlers(se) != 0) {
+		res = 6;
+		goto out3;
+	}
+
+	if (fuse_service_session_mount(service, se, 0, &opts) != 0) {
+		res = 4;
+		goto out4;
+	}
+
+	if (opts.singlethread) {
+		fuse_service_send_goodbye(service, 0);
+		fuse_service_release(service);
+
+		res = fuse_loop_versioned(fuse, version);
+	} else {
+		fuse_loop_cfg_set_clone_fd(loop_config, opts.clone_fd);
+		fuse_loop_cfg_set_idle_threads(loop_config, opts.max_idle_threads);
+		fuse_loop_cfg_set_max_threads(loop_config, opts.max_threads);
+
+		fuse_service_send_goodbye(service, 0);
+		fuse_service_release(service);
+
+		res = fuse_loop_mt(fuse, loop_config);
+	}
+	if (res)
+		res = 8;
+
+out4:
+	fuse_remove_signal_handlers(se);
+out3:
+	fuse_loop_cfg_destroy(loop_config);
+out2:
+	fuse_destroy(fuse);
+out1:
+	free(opts.mountpoint);
+out0:
+	fuse_service_send_goodbye(service, res);
+	fuse_service_release(service);
+	return res;
+}
+
+int fuse_main_real_versioned(int argc, char *argv[],
+			     const struct fuse_operations *op, size_t op_size,
+			     struct libfuse_version *version, void *user_data)
 {
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse *fuse;
 	struct fuse_cmdline_opts opts;
 	int res;
 	struct fuse_loop_config *loop_config = NULL;
+	bool self_daemonize = false;
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
@@ -342,31 +464,43 @@ int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
 		goto out1;
 	}
 
+	/* The application might have already started daemonization itself */
+	if (!fuse_daemonize_early_is_used()) {
+		int daemonize_early_flags = 0;
 
-	fuse = fuse_new_31(&args, op, op_size, user_data);
+		if (opts.foreground)
+			daemonize_early_flags |= FUSE_DAEMONIZE_NO_BACKGROUND;
+
+		res = fuse_daemonize_early_start(daemonize_early_flags);
+		if (res != 0) {
+			fuse_log(FUSE_LOG_ERR, "fuse: daemonize_early_start failed\n");
+			goto out1;
+		}
+		self_daemonize = true;
+	}
+
+	fuse = _fuse_new_31(&args, op, op_size, version, user_data);
 	if (fuse == NULL) {
 		res = 3;
 		goto out1;
 	}
 
+	struct fuse_session *se = fuse_get_session(fuse);
 	if (fuse_mount(fuse,opts.mountpoint) != 0) {
 		res = 4;
 		goto out2;
 	}
 
-	if (fuse_daemonize(opts.foreground) != 0) {
-		res = 5;
-		goto out3;
-	}
-
-	struct fuse_session *se = fuse_get_session(fuse);
 	if (fuse_set_signal_handlers(se) != 0) {
 		res = 6;
 		goto out3;
 	}
 
+	if (self_daemonize)
+		fuse_daemonize_early_success();
+
 	if (opts.singlethread)
-		res = fuse_loop(fuse);
+		res = fuse_loop_versioned(fuse, version);
 	else {
 		loop_config = fuse_loop_cfg_create();
 		if (loop_config == NULL) {
@@ -376,6 +510,7 @@ int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
 
 		fuse_loop_cfg_set_clone_fd(loop_config, opts.clone_fd);
 
+		fuse_loop_cfg_set_max_threads(loop_config, opts.max_threads);
 		fuse_loop_cfg_set_idle_threads(loop_config, opts.max_idle_threads);
 		res = fuse_loop_mt(fuse, loop_config);
 	}
@@ -394,8 +529,18 @@ out1:
 	return res;
 }
 
+/* Not symboled, as not part of the official API */
+int fuse_main_real_30(int argc, char *argv[], const struct fuse_operations *op,
+		      size_t op_size, void *user_data);
+int fuse_main_real_30(int argc, char *argv[], const struct fuse_operations *op,
+		      size_t op_size, void *user_data)
+{
+	struct libfuse_version version = { 0 };
+	return fuse_main_real_versioned(argc, argv, op, op_size, &version,
+					user_data);
+}
 
-void fuse_apply_conn_info_opts(struct fuse_conn_info_opts *opts,
+void fuse_apply_conn_info_opts(const struct fuse_conn_info_opts *opts,
 			       struct fuse_conn_info *conn)
 {
 	if(opts->set_max_write)
@@ -409,10 +554,17 @@ void fuse_apply_conn_info_opts(struct fuse_conn_info_opts *opts,
 	if(opts->set_max_readahead)
 		conn->max_readahead = opts->max_readahead;
 
-#define LL_ENABLE(cond,cap) \
-	if (cond) conn->want |= (cap)
-#define LL_DISABLE(cond,cap) \
-	if (cond) conn->want &= ~(cap)
+#define LL_ENABLE(cond, cap)                     \
+	do {                                     \
+		if (cond)                        \
+			fuse_set_feature_flag(conn, cap); \
+	} while (0)
+
+#define LL_DISABLE(cond, cap)                     \
+	do {                                      \
+		if (cond)                         \
+			fuse_unset_feature_flag(conn, cap); \
+	} while (0)
 
 	LL_ENABLE(opts->splice_read, FUSE_CAP_SPLICE_READ);
 	LL_DISABLE(opts->no_splice_read, FUSE_CAP_SPLICE_READ);

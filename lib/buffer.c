@@ -6,7 +6,7 @@
   fuse_bufvec`.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB
+  See the file LGPL2.txt
 */
 
 #define _GNU_SOURCE
@@ -25,10 +25,10 @@ size_t fuse_buf_size(const struct fuse_bufvec *bufv)
 	size_t size = 0;
 
 	for (i = 0; i < bufv->count; i++) {
-		if (bufv->buf[i].size == SIZE_MAX)
-			size = SIZE_MAX;
-		else
-			size += bufv->buf[i].size;
+		if (bufv->buf[i].size >= SIZE_MAX - size)
+			return SIZE_MAX;
+
+		size += bufv->buf[i].size;
 	}
 
 	return size;
@@ -43,7 +43,7 @@ static ssize_t fuse_buf_write(const struct fuse_buf *dst, size_t dst_off,
 			      const struct fuse_buf *src, size_t src_off,
 			      size_t len)
 {
-	ssize_t res = 0;
+	ssize_t res;
 	size_t copied = 0;
 
 	while (len) {
@@ -77,7 +77,7 @@ static ssize_t fuse_buf_read(const struct fuse_buf *dst, size_t dst_off,
 			     const struct fuse_buf *src, size_t src_off,
 			     size_t len)
 {
-	ssize_t res = 0;
+	ssize_t res;
 	size_t copied = 0;
 
 	while (len) {
@@ -116,7 +116,6 @@ static ssize_t fuse_buf_fd_to_fd(const struct fuse_buf *dst, size_t dst_off,
 		.size = sizeof(buf),
 		.flags = 0,
 	};
-	ssize_t res;
 	size_t copied = 0;
 
 	tmp.mem = buf;
@@ -124,6 +123,7 @@ static ssize_t fuse_buf_fd_to_fd(const struct fuse_buf *dst, size_t dst_off,
 	while (len) {
 		size_t this_len = min_size(tmp.size, len);
 		size_t read_len;
+		ssize_t res;
 
 		res = fuse_buf_read(&tmp, 0, src, src_off, this_len);
 		if (res < 0) {
@@ -167,7 +167,6 @@ static ssize_t fuse_buf_splice(const struct fuse_buf *dst, size_t dst_off,
 	off_t *dstpos = NULL;
 	off_t srcpos_val;
 	off_t dstpos_val;
-	ssize_t res;
 	size_t copied = 0;
 
 	if (flags & FUSE_BUF_SPLICE_MOVE)
@@ -185,7 +184,7 @@ static ssize_t fuse_buf_splice(const struct fuse_buf *dst, size_t dst_off,
 	}
 
 	while (len) {
-		res = splice(src->fd, srcpos, dst->fd, dstpos, len,
+		ssize_t res = splice(src->fd, srcpos, dst->fd, dstpos, len,
 			     splice_flags);
 		if (res == -1) {
 			if (copied)
